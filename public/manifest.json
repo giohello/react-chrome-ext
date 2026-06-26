@@ -3,7 +3,7 @@
   "name": "Blind Helper",
   "version": "1.0.0",
   "description": "Accessible Chrome extension that announces hovered and focused page elements for blind users.",
-  "permissions": ["tabs", "activeTab", "storage"],
+  "permissions": ["tabs", "activeTab", "storage", "scripting"],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "index.html"

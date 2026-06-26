@@ -68,6 +68,30 @@ function App() {
       );
     });
 
+  const injectContentScript = async (tabId: number) => {
+    if (!chromeApi?.scripting?.executeScript) {
+      return;
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      chromeApi.scripting.executeScript(
+        { target: { tabId }, files: ["assets/content.js"] },
+        () => {
+          const lastError = chromeApi.runtime?.lastError;
+          if (lastError) {
+            reject(
+              new Error(
+                lastError.message || "Content script injection failed.",
+              ),
+            );
+            return;
+          }
+          resolve();
+        },
+      );
+    });
+  };
+
   const sendToActiveTab = async (message: any) => {
     setError("");
     const tab = await getActiveTab();
@@ -75,16 +99,30 @@ function App() {
       throw new Error("Unable to find active tab or send a message.");
     }
 
-    return new Promise<any>((resolve, reject) => {
-      chromeApi.tabs.sendMessage(tab.id, message, (response: any) => {
-        const lastError = chromeApi.runtime?.lastError;
-        if (lastError) {
-          reject(new Error(lastError.message || "Failed to send message."));
-          return;
-        }
-        resolve(response);
+    const trySend = () =>
+      new Promise<any>((resolve, reject) => {
+        chromeApi.tabs.sendMessage(tab.id, message, (response: any) => {
+          const lastError = chromeApi.runtime?.lastError;
+          if (lastError) {
+            reject(new Error(lastError.message || "Failed to send message."));
+            return;
+          }
+          resolve(response);
+        });
       });
-    });
+
+    try {
+      return await trySend();
+    } catch (error: any) {
+      if (
+        error?.message?.includes("Receiving end does not exist") ||
+        error?.message?.includes("Could not establish connection")
+      ) {
+        await injectContentScript(tab.id);
+        return await trySend();
+      }
+      throw error;
+    }
   };
 
   const queryState = async () => {
@@ -186,22 +224,22 @@ function App() {
             checked={aiEnabled}
             onChange={(event) => setAiConfig(event.target.checked)}
           />
-          Use Gemini vision to analyze images and elements
+          Use Google Gemini vision to analyze images and elements
         </label>
         <p className="hint">
-          Paste a Gemini API key to enable visual analysis of images and
-          elements. Get a free key from your Gemini provider.
+          Paste a Google Gemini API key to enable visual analysis of images and
+          elements. Get a free key from Google AI Studio.
         </p>
       </section>
 
       <section className="field">
-        <label htmlFor="api-key">Gemini API Key</label>
+        <label htmlFor="api-key">Google Gemini API Key</label>
         <input
           id="api-key"
           type="password"
           value={apiKey}
           onChange={(event) => setApiKey(event.target.value)}
-          placeholder="gm-..."
+          placeholder="AQ.Ab8RN..."
         />
         <div className="field-actions">
           <button type="button" className="secondary" onClick={saveApiKey}>
@@ -232,7 +270,7 @@ function App() {
           <li>Enable the helper from this popup.</li>
           <li>Move your mouse over elements to hear descriptions.</li>
           <li>Use Tab to navigate focusable controls and labels.</li>
-          <li>Add a Gemini API key to analyze images visually.</li>
+          <li>Add a Google Gemini API key for AI-powered image analysis.</li>
         </ul>
       </section>
 

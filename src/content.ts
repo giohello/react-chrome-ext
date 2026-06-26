@@ -81,13 +81,25 @@ function createLiveRegion() {
   return region;
 }
 
+type DescriptionData = {
+  role: string;
+  label?: string;
+  alt?: string;
+  type?: string;
+  placeholder?: string;
+  value?: string;
+  link?: string;
+  text?: string;
+  tag: string;
+};
+
 function describeElement(element: Element | null) {
   if (!element) {
-    return "No element selected.";
+    return JSON.stringify({ role: "unknown", tag: "unknown" });
   }
 
   const tag = element.tagName.toLowerCase();
-  const role = element.getAttribute("role");
+  const role = element.getAttribute("role") || tag;
   const label =
     element.getAttribute("aria-label") ||
     getTextFromLabelledBy(element) ||
@@ -96,23 +108,27 @@ function describeElement(element: Element | null) {
   const alt = (element as HTMLImageElement).alt?.trim() || "";
   const value = (element as HTMLInputElement).value?.trim() || "";
   const placeholder = (element as HTMLInputElement).placeholder?.trim() || "";
-  const text = element.textContent?.trim() || "";
+  const text = getRenderedText(element);
+  const fallbackText =
+    text ||
+    getTextFromNearestTextContainer(element) ||
+    getTextFromNearbyElement(element);
   const href = element instanceof HTMLAnchorElement ? element.href : "";
   const type = element instanceof HTMLInputElement ? element.type : "";
 
-  const parts = [role || tag]
-    .concat(
-      label ? [`label: ${label}`] : [],
-      alt ? [`alt: ${alt}`] : [],
-      type ? [`type: ${type}`] : [],
-      placeholder ? [`placeholder: ${placeholder}`] : [],
-      value ? [`value: ${value}`] : [],
-      href ? [`link: ${href}`] : [],
-      text ? [`text: ${text}`] : [],
-    )
-    .filter(Boolean);
+  const data: DescriptionData = {
+    role,
+    tag,
+    label: label || undefined,
+    alt: alt || undefined,
+    type: type || undefined,
+    placeholder: placeholder || undefined,
+    value: value || undefined,
+    link: href || undefined,
+    text: fallbackText || undefined,
+  };
 
-  return parts.length > 0 ? parts.join(", ") : `Page element: ${tag}`;
+  return JSON.stringify(data);
 }
 
 function getTextFromLabelledBy(element: Element) {
@@ -126,18 +142,101 @@ function getTextFromLabelledBy(element: Element) {
     .join(" ");
 }
 
+function getTextFromNearbyElement(element: Element): string {
+  if (!(element instanceof HTMLElement)) {
+    return "";
+  }
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) {
+    return "";
+  }
+
+  const points = [
+    { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
+    { x: rect.left + 1, y: rect.top + 1 },
+    { x: rect.right - 1, y: rect.top + 1 },
+    { x: rect.left + 1, y: rect.bottom - 1 },
+    { x: rect.right - 1, y: rect.bottom - 1 },
+  ];
+
+  for (const point of points) {
+    const elements = document.elementsFromPoint(point.x, point.y);
+    for (const candidate of elements) {
+      if (candidate === element) {
+        continue;
+      }
+      if (!(candidate instanceof HTMLElement)) {
+        continue;
+      }
+      if (!isVisible(candidate)) {
+        continue;
+      }
+      const candidateText = candidate.textContent?.trim() || "";
+      if (candidateText.length > 1) {
+        return candidateText;
+      }
+    }
+  }
+
+  return "";
+}
+
+function getTextFromNearestTextContainer(element: Element): string {
+  if (!(element instanceof HTMLElement)) {
+    return "";
+  }
+
+  let current: HTMLElement | null = element;
+  while (current) {
+    const text = current.textContent?.trim() || "";
+    if (text.length > 1) {
+      return text;
+    }
+    current = current.parentElement;
+  }
+
+  return "";
+}
+
+function getRenderedText(element: Element): string {
+  if (!(element instanceof HTMLElement)) {
+    return "";
+  }
+
+  const text = element.innerText?.trim() || "";
+  if (text.length > 1) {
+    return text;
+  }
+
+  return element.textContent?.trim() || "";
+}
+
 function getFriendlyDescription(rawDescription: string) {
-  const fields = rawDescription
-    .split(", ")
-    .reduce<Record<string, string>>((acc, part, index) => {
-      const [key, ...rest] = part.split(": ");
-      if (rest.length > 0) {
-        acc[key.trim()] = rest.join(": ").trim();
-      } else if (index === 0) {
-        acc.role = key.trim();
+  let fields: Record<string, string> = {};
+
+  try {
+    const parsed = JSON.parse(rawDescription) as DescriptionData;
+    fields = Object.keys(parsed).reduce<Record<string, string>>((acc, key) => {
+      const value = (parsed as any)[key];
+      if (typeof value === "string" && value.trim()) {
+        acc[key] = value.trim();
       }
       return acc;
     }, {});
+  } catch {
+    fields = rawDescription
+      .split(", ")
+      .reduce<Record<string, string>>((acc, part, index) => {
+        const [key, ...rest] = part.split(": ");
+        if (rest.length > 0) {
+          acc[key.trim()] = rest.join(": ").trim();
+        } else if (index === 0) {
+          acc.role = key.trim();
+        }
+        return acc;
+      }, {});
+  }
 
   const role = fields.role || "item";
   const label = fields.label;
@@ -150,6 +249,7 @@ function getFriendlyDescription(rawDescription: string) {
   const pieces: string[] = [];
 
   const roleMap: Record<string, string> = {
+    a: "link",
     button: "button",
     link: "link",
     textbox: "input field",
@@ -162,9 +262,53 @@ function getFriendlyDescription(rawDescription: string) {
     image: "image",
     navigation: "navigation section",
     search: "search box",
+    h1: "heading 1",
+    h2: "heading 2",
+    h3: "heading 3",
+    h4: "heading 4",
+    h5: "heading 5",
+    h6: "heading 6",
+    p: "paragraph",
+    span: "text",
+    div: "section",
+    section: "section",
+    article: "article",
+    nav: "navigation",
+    header: "header",
+    footer: "footer",
+    main: "main content",
+    aside: "sidebar",
+    ul: "list",
+    ol: "numbered list",
+    li: "list item",
+    dl: "definition list",
+    dt: "definition term",
+    dd: "definition",
+    table: "table",
+    tr: "table row",
+    td: "table cell",
+    th: "table header cell",
+    thead: "table header",
+    tbody: "table body",
+    tfoot: "table footer",
+    form: "form",
+    fieldset: "field group",
+    legend: "label",
+    label: "label",
+    audio: "audio player",
+    video: "video player",
+    canvas: "canvas",
+    svg: "graphic",
+    blockquote: "quote",
+    code: "code",
+    pre: "code block",
+    strong: "emphasized text",
+    em: "emphasized text",
+    b: "bold text",
+    i: "italic text",
   };
 
-  pieces.push(roleMap[role] || "page item");
+  pieces.push(roleMap[role.toLowerCase()] || roleMap[role] || "page item");
 
   if (label) {
     pieces.push(`labeled ${label}`);
@@ -176,7 +320,7 @@ function getFriendlyDescription(rawDescription: string) {
     pieces.push(`with placeholder ${placeholder}`);
   }
 
-  if (href && role === "link") {
+  if (href && (role === "link" || role === "a" || role === "A")) {
     pieces.push(`link to ${href}`);
   }
 
@@ -236,7 +380,24 @@ async function analyzeVisualElementWithVision(
   element: Element,
   rawDescription: string,
 ): Promise<string> {
+  console.log(
+    "[Vision] Starting analysis. aiEnabled:",
+    aiEnabled,
+    "hasKey:",
+    !!geminiKey,
+    "isVisual:",
+    isVisualElement(element),
+  );
+
   if (!aiEnabled || !geminiKey || !isVisualElement(element)) {
+    console.log(
+      "[Vision] Skipping: aiEnabled=",
+      aiEnabled,
+      "geminiKey=",
+      !!geminiKey,
+      "isVisual=",
+      isVisualElement(element),
+    );
     return rawDescription;
   }
 
@@ -296,67 +457,77 @@ async function analyzeVisualElementWithVision(
       }
     }
 
-    const imageUrl = `data:${mediaType};base64,${imageData}`;
     const payload = {
-      model: "gpt-4.1-mini",
-      input: [
+      contents: [
         {
-          role: "user",
-          content: [
+          parts: [
             {
-              type: "input_text",
               text: "Describe this visual content in one or two sentences. Be concise and focus on what is visible.",
             },
             {
-              type: "input_image",
-              image_url: imageUrl,
+              inline_data: {
+                mime_type: mediaType,
+                data: imageData,
+              },
             },
           ],
         },
       ],
     };
 
-    const response = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${geminiKey}`,
+    console.log(
+      "[Vision] Sending to Google Gemini. Key preview:",
+      geminiKey.substring(0, 10) + "...",
+    );
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(geminiKey)}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
       },
-      body: JSON.stringify(payload),
-    });
+    );
 
     if (!response.ok) {
       const body = await response.text();
-      console.error("Vision API error:", body);
-      updateInfo("Gemini vision request failed. See console for details.");
+      console.error("[Vision] API error status:", response.status);
+      console.error("[Vision] API error body:", body);
+      updateInfo(`Vision failed (${response.status}). Check console.`);
       return rawDescription;
     }
 
+    console.log("[Vision] Got response, parsing...");
     const data = await response.json();
-    const outputItems = Array.isArray(data.output)
-      ? data.output
-      : [data.output];
+    console.log(
+      "[Vision] Response data:",
+      JSON.stringify(data).substring(0, 300) + "...",
+    );
+
     let resultText = "";
 
-    for (const output of outputItems) {
-      if (!output || !Array.isArray(output.content)) {
-        continue;
-      }
-      for (const item of output.content) {
-        if (item?.type === "output_text" && item?.text) {
-          resultText += item.text;
+    if (
+      data.candidates &&
+      data.candidates[0] &&
+      data.candidates[0].content &&
+      data.candidates[0].content.parts
+    ) {
+      const parts = data.candidates[0].content.parts;
+      for (const part of parts) {
+        if (part.text) {
+          resultText += part.text;
         }
       }
     }
 
-    if (!resultText.trim() && typeof data.output_text === "string") {
-      resultText = data.output_text;
-    }
-
     if (resultText.trim()) {
+      console.log("[Vision] Success. Text:", resultText.substring(0, 100));
       return `Visual content: ${resultText.trim()}`;
     }
 
+    console.log("[Vision] No text extracted from response");
     updateInfo("Gemini responded but no text was extracted.");
     return rawDescription;
   } catch (err) {
@@ -427,10 +598,16 @@ function setHighlight(element: Element | null) {
   }
 
   highlight.style.display = "block";
-  highlight.style.left = `${rect.left + window.scrollX}px`;
-  highlight.style.top = `${rect.top + window.scrollY}px`;
+  highlight.style.left = `${rect.left}px`;
+  highlight.style.top = `${rect.top}px`;
   highlight.style.width = `${rect.width}px`;
   highlight.style.height = `${rect.height}px`;
+}
+
+function refreshHighlight() {
+  if (currentTarget && isEnabled) {
+    setHighlight(currentTarget);
+  }
 }
 
 function isVisible(element: HTMLElement) {
@@ -457,7 +634,46 @@ function loadAiConfig() {
   chrome.storage.local.get(["aiEnabled", "geminiKey"], (result: any) => {
     aiEnabled = Boolean(result.aiEnabled);
     geminiKey = result.geminiKey || "";
+    console.log(
+      "[Config] Loaded. aiEnabled:",
+      aiEnabled,
+      "geminiKey set:",
+      !!geminiKey,
+    );
+
+    if (geminiKey) {
+      checkAvailableModels();
+    }
   });
+}
+
+async function checkAvailableModels() {
+  try {
+    console.log("[Debug] Checking available models with your API key...");
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(geminiKey)}`,
+    );
+
+    if (!response.ok) {
+      console.error(
+        "[Debug] Failed to list models:",
+        response.status,
+        await response.text(),
+      );
+      return;
+    }
+
+    const data = await response.json();
+    const models = (data.models || [])
+      .filter((m: any) =>
+        m.supportedGenerationMethods?.includes("generateContent"),
+      )
+      .map((m: any) => m.name);
+
+    console.log("[Debug] Available vision models:", models);
+  } catch (err) {
+    console.error("[Debug] Error checking models:", err);
+  }
 }
 
 function updateState(enabled: boolean) {
@@ -547,6 +763,12 @@ function handleMessage(message: any, _sender: any, sendResponse: any) {
   if (message.action === "setAiConfig") {
     aiEnabled = Boolean(message.aiEnabled);
     geminiKey = message.geminiKey || "";
+    console.log(
+      "[Message] setAiConfig received. aiEnabled:",
+      aiEnabled,
+      "geminiKey set:",
+      !!geminiKey,
+    );
     sendResponse({ ok: true });
     return;
   }
@@ -585,6 +807,8 @@ chrome.runtime.onMessage.addListener(handleMessage);
 
 window.addEventListener("mousemove", handleMouseMove, true);
 window.addEventListener("keydown", handleKeyDown, true);
+window.addEventListener("scroll", refreshHighlight, true);
+window.addEventListener("resize", refreshHighlight);
 
 loadAiConfig();
 updateState(false);
