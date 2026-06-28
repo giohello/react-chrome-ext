@@ -1,9 +1,114 @@
+type LanguageOption = {
+  code: string;
+  label: string;
+  aiName: string;
+};
+
+const LANGUAGES: LanguageOption[] = [
+  { code: "en-US", label: "English", aiName: "English" },
+  { code: "ka-GE", label: "Georgian (ქართული)", aiName: "Georgian" },
+  { code: "ru-RU", label: "Russian (Русский)", aiName: "Russian" },
+  { code: "es-ES", label: "Spanish (Español)", aiName: "Spanish" },
+  { code: "fr-FR", label: "French (Français)", aiName: "French" },
+  { code: "de-DE", label: "German (Deutsch)", aiName: "German" },
+  { code: "tr-TR", label: "Turkish (Türkçe)", aiName: "Turkish" },
+  { code: "ar-SA", label: "Arabic (العربية)", aiName: "Arabic" },
+  { code: "zh-CN", label: "Chinese (中文)", aiName: "Chinese" },
+  { code: "ja-JP", label: "Japanese (日本語)", aiName: "Japanese" },
+  // Not selectable in the popup, but recognized so speech-language
+  // auto-detection can name them correctly in notices.
+  { code: "ko-KR", label: "Korean (한국어)", aiName: "Korean" },
+  { code: "el-GR", label: "Greek (Ελληνικά)", aiName: "Greek" },
+  { code: "he-IL", label: "Hebrew (עברית)", aiName: "Hebrew" },
+  { code: "hi-IN", label: "Hindi (हिन्दी)", aiName: "Hindi" },
+  { code: "th-TH", label: "Thai (ไทย)", aiName: "Thai" },
+];
+
+const DEFAULT_LANGUAGE_CODE = "en-US";
+
+function getLanguage(code: string): LanguageOption {
+  return LANGUAGES.find((lang) => lang.code === code) ?? LANGUAGES[0];
+}
+
+// Detects which language to *speak* text in by looking at the actual
+// Unicode script the text is written in, rather than trusting a
+// configured setting. This matters because the text being spoken (DOM
+// content, or an AI description) isn't necessarily in whatever language
+// the popup's "AI description language" picker is set to — that picker
+// only controls what language Gemini is asked to write descriptions in.
+// Latin-script languages (English, German, Spanish, Turkish, etc.) can't
+// be reliably told apart by script alone, so they all fall back to the
+// default voice — only non-Latin scripts get a confident, specific match.
+function detectScriptLanguage(text: string): string {
+  const scriptRanges: { code: string; test: RegExp }[] = [
+    { code: "ka-GE", test: /[\u10A0-\u10FF\u1C90-\u1CBF]/ },
+    { code: "ru-RU", test: /[\u0400-\u04FF]/ },
+    { code: "ar-SA", test: /[\u0600-\u06FF\u0750-\u077F]/ },
+    { code: "zh-CN", test: /[\u4E00-\u9FFF]/ },
+    { code: "ja-JP", test: /[\u3040-\u30FF]/ },
+    { code: "ko-KR", test: /[\uAC00-\uD7A3]/ },
+    { code: "el-GR", test: /[\u0370-\u03FF]/ },
+    { code: "he-IL", test: /[\u0590-\u05FF]/ },
+    { code: "hi-IN", test: /[\u0900-\u097F]/ },
+    { code: "th-TH", test: /[\u0E00-\u0E7F]/ },
+  ];
+
+  for (const { code, test } of scriptRanges) {
+    if (test.test(text)) {
+      return code;
+    }
+  }
+
+  return DEFAULT_LANGUAGE_CODE;
+}
+
 const chrome = (window as any).chrome;
 let isEnabled = false;
 let currentTarget: Element | null = null;
 let focusIndex = -1;
 let aiEnabled = false;
 let geminiKey = "";
+const SPEECH_RATE_MIN = 0.5;
+const SPEECH_RATE_MAX = 2.5;
+const SPEECH_RATE_DEFAULT = 1;
+const SPEECH_RATE_STEP = 0.1;
+let speechRate = SPEECH_RATE_DEFAULT;
+let speechLang = DEFAULT_LANGUAGE_CODE;
+let forcedVoiceName: string = "";
+let hoverTimer: number | null = null;
+let hoverToken = 0;
+const AI_DWELL_MS = 500;
+let aiRateLimitedUntil = 0;
+let rateLimitNoticeActive = false;
+let lastAiCallAt = 0;
+const AI_MIN_INTERVAL_MS = 4000; // never fire more than one AI call this often
+let elevenLabsKey = "";
+let elevenLabsVoiceId = "21m00Tcm4TlvDq8ikWAM"; // ElevenLabs' default "Rachel" premade voice
+let useElevenLabs = false;
+let geminiDailyLimit = 20; // updated automatically if Gemini reports a different limit
+let currentCloudAudio: HTMLAudioElement | null = null;
+let elevenLabsAbortController: AbortController | null = null;
+let elevenLabsDebounceTimer: number | null = null;
+const ELEVENLABS_DEBOUNCE_MS = 250;
+let pendingSpeakTimer: number | null = null;
+// Bumped on every new announce() call (and on stopSpeech/disable). Async
+// continuations — the cloud TTS fallback, the delayed local-speak timer —
+// capture the generation they belong to and check it before actually
+// producing audio, so a slow/failed call that's been superseded by a
+// newer hover never gets to speak after the fact.
+let speechGeneration = 0;
+
+function clampSpeechRate(rate: number) {
+  return (
+    Math.round(
+      Math.min(SPEECH_RATE_MAX, Math.max(SPEECH_RATE_MIN, rate)) * 10,
+    ) / 10
+  );
+}
+
+function formatSpeechRate(rate: number) {
+  return rate.toFixed(1);
+}
 
 const highlight = createHighlightOverlay();
 const infoPanel = createInfoPanel();
@@ -106,7 +211,12 @@ function describeElement(element: Element | null) {
     (element as HTMLElement).getAttribute("title") ||
     "";
   const alt = (element as HTMLImageElement).alt?.trim() || "";
-  const value = (element as HTMLInputElement).value?.trim() || "";
+  const value =
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLTextAreaElement ||
+    element instanceof HTMLSelectElement
+      ? String(element.value ?? "").trim()
+      : "";
   const placeholder = (element as HTMLInputElement).placeholder?.trim() || "";
   const text = getRenderedText(element);
   const fallbackText =
@@ -361,7 +471,13 @@ async function getBase64FromUrl(url: string): Promise<string | null> {
     const blob = await response.blob();
     return await blobToBase64(blob);
   } catch (err) {
-    console.error("Failed to fetch visual asset:", err);
+    console.error(
+      "Failed to fetch visual asset (likely a CORS restriction on this image's server):",
+      err,
+    );
+    updateInfo(
+      "Couldn't analyze this image (blocked by the site's CORS policy). Using text description instead.",
+    );
     return null;
   }
 }
@@ -372,6 +488,65 @@ function serializeSvg(element: SVGElement): string | null {
     return serializer.serializeToString(element);
   } catch (err) {
     console.error("SVG serialization failed:", err);
+    return null;
+  }
+}
+
+function extractQuotaValue(errorBody: string): number | null {
+  try {
+    const parsed = JSON.parse(errorBody);
+    const details = parsed?.error?.details;
+    if (!Array.isArray(details)) return null;
+    const quotaFailure = details.find((d: any) =>
+      String(d["@type"] || "").includes("QuotaFailure"),
+    );
+    const value = quotaFailure?.violations?.[0]?.quotaValue;
+    const parsedValue = parseInt(value, 10);
+    return Number.isFinite(parsedValue) ? parsedValue : null;
+  } catch {
+    return null;
+  }
+}
+
+// Gemini's API doesn't expose remaining quota anywhere, so we track our own
+// call history locally and estimate usage against the last known daily
+// limit. This is an estimate, not a guarantee — Google's actual reset timing
+// may not align exactly with a rolling 24h window.
+function recordGeminiCall() {
+  if (!chrome?.storage?.local) return;
+  chrome.storage.local.get(["geminiCallLog"], (result: any) => {
+    const now = Date.now();
+    const oneDayAgo = now - 24 * 60 * 60 * 1000;
+    const log: number[] = Array.isArray(result.geminiCallLog)
+      ? result.geminiCallLog
+      : [];
+    const pruned = log.filter((t) => t > oneDayAgo);
+    pruned.push(now);
+    chrome.storage.local.set({ geminiCallLog: pruned });
+  });
+}
+
+function persistRateLimitState() {
+  if (!chrome?.storage?.local) return;
+  chrome.storage.local.set({
+    aiRateLimitedUntil,
+    geminiDailyLimit,
+  });
+}
+
+function extractRetryDelayMs(errorBody: string): number | null {
+  try {
+    const parsed = JSON.parse(errorBody);
+    const details = parsed?.error?.details;
+    if (!Array.isArray(details)) return null;
+    const retryInfo = details.find((d: any) =>
+      String(d["@type"] || "").includes("RetryInfo"),
+    );
+    const retryDelay = retryInfo?.retryDelay; // e.g. "21s"
+    if (typeof retryDelay !== "string") return null;
+    const seconds = parseFloat(retryDelay.replace("s", ""));
+    return Number.isFinite(seconds) ? Math.ceil(seconds * 1000) : null;
+  } catch {
     return null;
   }
 }
@@ -400,6 +575,22 @@ async function analyzeVisualElementWithVision(
     );
     return rawDescription;
   }
+
+  if (Date.now() < aiRateLimitedUntil) {
+    console.log(
+      "[Vision] Skipping: still rate-limited for",
+      Math.ceil((aiRateLimitedUntil - Date.now()) / 1000),
+      "more seconds",
+    );
+    return rawDescription;
+  }
+
+  if (Date.now() - lastAiCallAt < AI_MIN_INTERVAL_MS) {
+    console.log("[Vision] Skipping: calling AI too frequently, back off a bit");
+    return rawDescription;
+  }
+  lastAiCallAt = Date.now();
+  recordGeminiCall();
 
   try {
     let imageData: string | null = null;
@@ -462,7 +653,7 @@ async function analyzeVisualElementWithVision(
         {
           parts: [
             {
-              text: "Describe this visual content in one or two sentences. Be concise and focus on what is visible.",
+              text: `Describe this visual content in one or two sentences, in ${getLanguage(speechLang).aiName}. Be concise and focus on what is visible. Respond only in ${getLanguage(speechLang).aiName}, with no English unless that is the element's actual text.`,
             },
             {
               inline_data: {
@@ -495,7 +686,31 @@ async function analyzeVisualElementWithVision(
       const body = await response.text();
       console.error("[Vision] API error status:", response.status);
       console.error("[Vision] API error body:", body);
-      updateInfo(`Vision failed (${response.status}). Check console.`);
+
+      if (response.status === 429) {
+        const retryMs = extractRetryDelayMs(body) ?? 30000;
+        aiRateLimitedUntil = Date.now() + retryMs;
+        const reportedLimit = extractQuotaValue(body);
+        if (reportedLimit) {
+          geminiDailyLimit = reportedLimit;
+        }
+        persistRateLimitState();
+
+        if (!rateLimitNoticeActive) {
+          rateLimitNoticeActive = true;
+          const seconds = Math.ceil(retryMs / 1000);
+          const notice = `AI image descriptions paused: Gemini's free daily quota is used up. Using basic descriptions for about ${seconds} seconds, or until tomorrow if the quota resets daily.`;
+          updateInfo(notice);
+          announce(notice);
+          window.setTimeout(() => {
+            rateLimitNoticeActive = false;
+            persistRateLimitState();
+          }, retryMs);
+        }
+      } else {
+        updateInfo(`Vision failed (${response.status}). Check console.`);
+      }
+
       return rawDescription;
     }
 
@@ -524,7 +739,7 @@ async function analyzeVisualElementWithVision(
 
     if (resultText.trim()) {
       console.log("[Vision] Success. Text:", resultText.substring(0, 100));
-      return `Visual content: ${resultText.trim()}`;
+      return resultText.trim();
     }
 
     console.log("[Vision] No text extracted from response");
@@ -545,36 +760,353 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
-async function getDescriptionWithVision(
-  element: Element,
-  rawDescription: string,
-): Promise<string> {
-  if (!aiEnabled) {
-    return rawDescription;
-  }
-
-  const friendly = getFriendlyDescription(rawDescription);
-
-  if (isVisualElement(element)) {
-    return await analyzeVisualElementWithVision(element, friendly);
-  }
-
-  return friendly;
-}
-
 function updateInfo(text: string) {
   infoPanel.textContent = text;
   liveRegion.textContent = text;
 }
 
-function announce(text: string) {
-  updateInfo(text);
+function stopSpeech() {
   if ("speechSynthesis" in window) {
     window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 1;
-    window.speechSynthesis.speak(utterance);
   }
+  if (currentCloudAudio) {
+    currentCloudAudio.pause();
+    currentCloudAudio = null;
+  }
+  if (elevenLabsAbortController) {
+    elevenLabsAbortController.abort();
+    elevenLabsAbortController = null;
+  }
+  if (elevenLabsDebounceTimer) {
+    window.clearTimeout(elevenLabsDebounceTimer);
+    elevenLabsDebounceTimer = null;
+  }
+  speechGeneration++; // invalidate any pending debounced/delayed speech
+  if (pendingSpeakTimer) {
+    window.clearTimeout(pendingSpeakTimer);
+    pendingSpeakTimer = null;
+  }
+  if (lastAnnounce.timeout) {
+    window.clearTimeout(lastAnnounce.timeout);
+    lastAnnounce.timeout = 0;
+  }
+}
+
+// Only returns a voice that actually claims to support this language
+// (exact or base-language match). Returns undefined if there's no real
+// local support — callers use that to decide whether to reach for a
+// cloud voice instead of guessing with a fallback.
+function pickExactVoiceForLanguage(
+  lang: string,
+): SpeechSynthesisVoice | undefined {
+  if (!("speechSynthesis" in window)) {
+    return undefined;
+  }
+  const voices = window.speechSynthesis.getVoices();
+  if (voices.length === 0) {
+    return undefined;
+  }
+  const exact = voices.find((v) => v.lang === lang);
+  if (exact) return exact;
+  const base = lang.split("-")[0];
+  return voices.find((v) =>
+    v.lang.toLowerCase().startsWith(base.toLowerCase()),
+  );
+}
+
+// Last-resort guess for when there's no real local voice and no cloud
+// voice is available either. Google's network voices use a broader
+// multilingual model and will generally attempt any script with an
+// accent rather than producing no audio at all — better than nothing,
+// but not a substitute for real support.
+function pickOmnivorousFallbackVoice(): SpeechSynthesisVoice | undefined {
+  if (!("speechSynthesis" in window)) {
+    return undefined;
+  }
+  const voices = window.speechSynthesis.getVoices();
+  return voices.find((v) => v.name.includes("Google"));
+}
+
+let voiceMissingWarnedFor: string | null = null;
+
+let elevenLabsBlockedReason: string | null = null;
+
+async function speakWithElevenLabs(text: string): Promise<boolean> {
+  if (!elevenLabsKey || !elevenLabsVoiceId) {
+    return false;
+  }
+
+  if (elevenLabsBlockedReason) {
+    // We already know this config can't work (e.g. a 401/402 from a voice
+    // ID this account can't use via the API). Don't keep re-hitting the
+    // network on every single hover until the user changes something.
+    return false;
+  }
+
+  // Cancel any previous in-flight request. ElevenLabs caps free accounts
+  // at a couple of concurrent requests — rapid hovering was firing several
+  // overlapping fetches before any of them resolved, which both burned
+  // through that concurrency limit AND looked like abusive traffic to
+  // their systems. A new utterance always supersedes whatever was being
+  // requested before, so there's never a reason to let an old one finish.
+  if (elevenLabsAbortController) {
+    elevenLabsAbortController.abort();
+  }
+  const controller = new AbortController();
+  elevenLabsAbortController = controller;
+
+  if (currentCloudAudio) {
+    currentCloudAudio.pause();
+    currentCloudAudio = null;
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${elevenLabsVoiceId}`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": elevenLabsKey,
+          "Content-Type": "application/json",
+          Accept: "audio/mpeg",
+        },
+        body: JSON.stringify({
+          text,
+          model_id: "eleven_multilingual_v2",
+        }),
+        signal: controller.signal,
+      },
+    );
+
+    // A newer call (or a disable) superseded this one while we were
+    // waiting on the network — discard the result, it's no longer relevant.
+    if (controller.signal.aborted || !isEnabled) {
+      return false;
+    }
+
+    if (!response.ok) {
+      const body = await response.text();
+      console.error("[ElevenLabs] API error:", response.status, body);
+
+      if (response.status === 401 || response.status === 402) {
+        // This is an account/permission problem, not a transient one —
+        // retrying on every hover won't help until the user picks a
+        // different voice ID or fixes their plan.
+        elevenLabsBlockedReason = `ElevenLabs voice unavailable (${response.status}). This voice ID isn't usable on your current plan via the API — pick a different voice from "My Voices" in the popup, or add one from the Voice Library to your account first.`;
+        updateInfo(elevenLabsBlockedReason);
+        announce(elevenLabsBlockedReason);
+      } else if (response.status === 429) {
+        // Concurrency/rate limit — transient, just let it fall back to
+        // the local voice for this utterance rather than blocking entirely.
+        updateInfo(
+          `ElevenLabs is rate-limited (429). Falling back to local voice for now.`,
+        );
+      } else {
+        updateInfo(
+          `ElevenLabs voice failed (${response.status}). Falling back to local voice.`,
+        );
+      }
+      return false;
+    }
+
+    const blob = await response.blob();
+
+    if (controller.signal.aborted || !isEnabled) {
+      return false;
+    }
+
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    currentCloudAudio = audio;
+    audio.onended = () => {
+      URL.revokeObjectURL(url);
+      if (currentCloudAudio === audio) {
+        currentCloudAudio = null;
+      }
+    };
+    await audio.play();
+    return true;
+  } catch (err) {
+    if ((err as any)?.name === "AbortError") {
+      // Expected — a newer utterance or a disable canceled this request.
+      return false;
+    }
+    console.error("[ElevenLabs] request failed:", err);
+    return false;
+  }
+}
+
+function announce(text: string, rate = speechRate) {
+  if (!isEnabled) {
+    return;
+  }
+
+  updateInfo(text);
+
+  // Every new utterance supersedes whatever's currently playing, no matter
+  // which engine produced it. This has to happen unconditionally up front
+  // — not just inside whichever branch we're about to take — otherwise
+  // switching from an element that used the local voice to one that uses
+  // the cloud voice (or vice versa) leaves the old one still talking while
+  // the new one starts.
+  window.speechSynthesis?.cancel();
+  if (currentCloudAudio) {
+    currentCloudAudio.pause();
+    currentCloudAudio = null;
+  }
+  if (elevenLabsAbortController) {
+    elevenLabsAbortController.abort();
+    elevenLabsAbortController = null;
+  }
+  if (elevenLabsDebounceTimer) {
+    window.clearTimeout(elevenLabsDebounceTimer);
+    elevenLabsDebounceTimer = null;
+  }
+  if (pendingSpeakTimer) {
+    window.clearTimeout(pendingSpeakTimer);
+    pendingSpeakTimer = null;
+  }
+
+  // Tag this call so any async work it kicks off (the cloud-voice debounce,
+  // the delayed local-speak timer, the cloud fallback) can tell whether
+  // it's been superseded by a newer announce() before it actually speaks.
+  const myGeneration = ++speechGeneration;
+
+  // Speak in whatever language the text actually appears to be in, not
+  // whatever the "AI description language" setting is — that setting only
+  // controls what language Gemini writes descriptions in. The DOM text
+  // being read can be in any language regardless.
+  const detectedLang = detectScriptLanguage(text);
+
+  const forcedVoice = forcedVoiceName
+    ? window.speechSynthesis
+        ?.getVoices()
+        .find((v) => v.name === forcedVoiceName)
+    : undefined;
+
+  // A manual override always wins outright — it means the user already
+  // confirmed this voice actually produces audio for what they need.
+  const exactLocalVoice =
+    forcedVoice ?? pickExactVoiceForLanguage(detectedLang);
+  const hasRealLocalVoice = !!exactLocalVoice;
+
+  const speakLocally = (
+    voice: SpeechSynthesisVoice | undefined,
+    noticeIfMissing: boolean,
+  ) => {
+    if (!("speechSynthesis" in window)) {
+      return;
+    }
+
+    const speakNow = () => {
+      pendingSpeakTimer = null;
+      if (myGeneration !== speechGeneration || !isEnabled) {
+        // Superseded by a newer hover, or disabled, since this was
+        // scheduled — don't let stale speech start.
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = rate;
+      utterance.lang = detectedLang;
+
+      if (voice) {
+        utterance.voice = voice;
+      } else if (noticeIfMissing && detectedLang !== DEFAULT_LANGUAGE_CODE) {
+        if (voiceMissingWarnedFor !== detectedLang) {
+          voiceMissingWarnedFor = detectedLang;
+          const langName = getLanguage(detectedLang).aiName;
+          console.warn(
+            `[Speech] No installed voice found for ${detectedLang}. Trying anyway with the lang tag set. ` +
+              `Install a system/Chrome voice pack for this language for reliable speech.`,
+          );
+          updateInfo(
+            `Note: no ${langName} voice is installed on this device. Attempting to speak detected ${langName} text anyway — install a ${langName} system voice, pick a Narrator voice override, or enable ElevenLabs cloud voice in the popup, if you hear nothing.`,
+          );
+        }
+      }
+
+      utterance.onerror = (event) => {
+        if (event.error === "interrupted" || event.error === "canceled") {
+          // Expected when the user moves to a new element before the
+          // previous utterance finished — not an actual problem.
+          return;
+        }
+        console.error(
+          "[Speech] utterance error:",
+          event.error,
+          "for detected lang",
+          detectedLang,
+        );
+      };
+      utterance.onstart = () => {
+        console.log(
+          "[Speech] speaking, detected lang:",
+          detectedLang,
+          "voice:",
+          utterance.voice?.name || "(none/default)",
+        );
+      };
+
+      window.speechSynthesis.speak(utterance);
+    };
+
+    // Chrome has a known bug where speak() called immediately after cancel()
+    // can silently drop the utterance. A tiny delay avoids the race.
+    if (pendingSpeakTimer) {
+      window.clearTimeout(pendingSpeakTimer);
+    }
+    pendingSpeakTimer = window.setTimeout(speakNow, 30);
+  };
+
+  console.log(
+    "[Speech] decision — detectedLang:",
+    detectedLang,
+    "hasRealLocalVoice:",
+    hasRealLocalVoice,
+    "(",
+    exactLocalVoice?.name || "none",
+    ")",
+    "useElevenLabs:",
+    useElevenLabs,
+    "elevenLabsKey set:",
+    !!elevenLabsKey,
+    "elevenLabsBlockedReason:",
+    elevenLabsBlockedReason,
+  );
+
+  if (hasRealLocalVoice) {
+    // A real local voice exists for this language (or the user manually
+    // forced one) — use it. It's free and instant; no reason to spend
+    // ElevenLabs character quota on a language that already works.
+    speakLocally(exactLocalVoice, false);
+  } else if (useElevenLabs && elevenLabsKey) {
+    // No real local voice for this language — this is exactly the case
+    // ElevenLabs is for. But don't fire the network request immediately:
+    // aborting an in-flight fetch when a newer hover arrives doesn't
+    // guarantee the previous request gets canceled on ElevenLabs' server
+    // in time, which is exactly what was tripping their concurrency limit
+    // during fast hovering. Instead, wait briefly for the hover to settle
+    // — only the last one within this window actually reaches the network.
+    elevenLabsDebounceTimer = window.setTimeout(() => {
+      elevenLabsDebounceTimer = null;
+      if (myGeneration !== speechGeneration || !isEnabled) {
+        // A newer hover (or a disable) superseded this one before it ever
+        // reached the network — correctly do nothing.
+        return;
+      }
+      speakWithElevenLabs(text).then((succeeded) => {
+        if (!succeeded && isEnabled && myGeneration === speechGeneration) {
+          speakLocally(pickOmnivorousFallbackVoice(), true);
+        }
+      });
+    }, ELEVENLABS_DEBOUNCE_MS);
+  } else {
+    // No real local voice and no cloud voice configured — best-effort
+    // guess with whatever omnivorous voice might be installed.
+    speakLocally(pickOmnivorousFallbackVoice(), true);
+  }
+
   if (lastAnnounce.timeout) {
     window.clearTimeout(lastAnnounce.timeout);
   }
@@ -626,25 +1158,83 @@ function collectFocusableElements() {
   );
 }
 
-function loadAiConfig() {
+function applySpeechRate(rate: number, announceChange = false) {
+  speechRate = clampSpeechRate(rate);
+  if (announceChange) {
+    announce(`Speech speed ${formatSpeechRate(speechRate)}`, speechRate);
+  }
+}
+
+function loadSettings() {
   if (!chrome?.storage?.local?.get) {
     return;
   }
 
-  chrome.storage.local.get(["aiEnabled", "geminiKey"], (result: any) => {
-    aiEnabled = Boolean(result.aiEnabled);
-    geminiKey = result.geminiKey || "";
-    console.log(
-      "[Config] Loaded. aiEnabled:",
-      aiEnabled,
-      "geminiKey set:",
-      !!geminiKey,
-    );
+  chrome.storage.local.get(
+    [
+      "aiEnabled",
+      "geminiKey",
+      "speechRate",
+      "speechLang",
+      "forcedVoiceName",
+      "elevenLabsKey",
+      "elevenLabsVoiceId",
+      "useElevenLabs",
+      "geminiDailyLimit",
+    ],
+    (result: any) => {
+      aiEnabled = Boolean(result.aiEnabled);
+      geminiKey = result.geminiKey || "";
+      speechLang = result.speechLang || DEFAULT_LANGUAGE_CODE;
+      forcedVoiceName = result.forcedVoiceName || "";
+      elevenLabsKey = result.elevenLabsKey || "";
+      elevenLabsVoiceId = result.elevenLabsVoiceId || elevenLabsVoiceId;
+      useElevenLabs = Boolean(result.useElevenLabs);
+      geminiDailyLimit =
+        typeof result.geminiDailyLimit === "number"
+          ? result.geminiDailyLimit
+          : geminiDailyLimit;
+      voiceMissingWarnedFor = null;
+      applySpeechRate(
+        typeof result.speechRate === "number"
+          ? result.speechRate
+          : SPEECH_RATE_DEFAULT,
+      );
+      console.log(
+        "[Config] Loaded. aiEnabled:",
+        aiEnabled,
+        "geminiKey set:",
+        !!geminiKey,
+        "speechRate:",
+        speechRate,
+        "speechLang:",
+        speechLang,
+        "useElevenLabs:",
+        useElevenLabs,
+        "elevenLabsKey set:",
+        !!elevenLabsKey,
+        "elevenLabsVoiceId:",
+        elevenLabsVoiceId,
+      );
 
-    if (geminiKey) {
-      checkAvailableModels();
-    }
-  });
+      if (geminiKey) {
+        checkAvailableModels();
+      }
+    },
+  );
+}
+
+function saveSpeechRate(rate: number) {
+  if (!chrome?.storage?.local?.set) {
+    return;
+  }
+
+  chrome.storage.local.set({ speechRate: rate });
+}
+
+function adjustSpeechRate(delta: number) {
+  applySpeechRate(speechRate + delta, true);
+  saveSpeechRate(speechRate);
 }
 
 async function checkAvailableModels() {
@@ -683,6 +1273,8 @@ function updateState(enabled: boolean) {
       "Blind Helper is active. Hover elements or press Tab to navigate.",
     );
   } else {
+    stopSpeech();
+    currentTarget = null;
     updateInfo("Blind Helper is disabled. Open the popup to enable it.");
     setHighlight(null);
   }
@@ -690,11 +1282,37 @@ function updateState(enabled: boolean) {
 
 function describeAndAnnounce(element: Element | null) {
   if (!element) return;
+
+  if (hoverTimer) {
+    window.clearTimeout(hoverTimer);
+    hoverTimer = null;
+  }
+
+  // Always speak the fast, DOM-based description immediately.
   const rawDescription = describeElement(element);
-  getDescriptionWithVision(element, rawDescription).then((description) => {
+  const friendly = getFriendlyDescription(rawDescription);
+  setHighlight(element);
+  announce(friendly);
+
+  // Only spend an AI vision call if the user actually dwells on this element.
+  if (!aiEnabled || !isVisualElement(element)) {
+    return;
+  }
+
+  const myToken = ++hoverToken;
+  hoverTimer = window.setTimeout(async () => {
+    const aiDescription = await analyzeVisualElementWithVision(
+      element,
+      friendly,
+    );
+
+    if (myToken !== hoverToken || !isEnabled || currentTarget !== element) {
+      return;
+    }
+
     setHighlight(element);
-    announce(description);
-  });
+    announce(aiDescription);
+  }, AI_DWELL_MS);
 }
 
 async function handleMouseMove(event: MouseEvent) {
@@ -714,11 +1332,25 @@ async function handleMouseMove(event: MouseEvent) {
   }
 
   currentTarget = target;
-  await describeAndAnnounce(target);
+  describeAndAnnounce(target);
 }
 
 async function handleKeyDown(event: KeyboardEvent) {
   if (!isEnabled) {
+    return;
+  }
+
+  if (event.altKey && event.shiftKey && event.key === "ArrowUp") {
+    event.preventDefault();
+    event.stopPropagation();
+    adjustSpeechRate(SPEECH_RATE_STEP);
+    return;
+  }
+
+  if (event.altKey && event.shiftKey && event.key === "ArrowDown") {
+    event.preventDefault();
+    event.stopPropagation();
+    adjustSpeechRate(-SPEECH_RATE_STEP);
     return;
   }
 
@@ -745,7 +1377,7 @@ async function handleKeyDown(event: KeyboardEvent) {
 
     const next = focusables[focusIndex];
     next.focus();
-    await describeAndAnnounce(next);
+    describeAndAnnounce(next);
   }
 }
 
@@ -773,8 +1405,46 @@ function handleMessage(message: any, _sender: any, sendResponse: any) {
     return;
   }
 
+  if (message.action === "setSpeechRate") {
+    applySpeechRate(Number(message.speechRate));
+    sendResponse({ speechRate });
+    return;
+  }
+
+  if (message.action === "setLanguage") {
+    speechLang = message.speechLang || DEFAULT_LANGUAGE_CODE;
+    voiceMissingWarnedFor = null;
+    sendResponse({ speechLang });
+    return;
+  }
+
+  if (message.action === "setForcedVoice") {
+    forcedVoiceName = message.forcedVoiceName || "";
+    sendResponse({ forcedVoiceName });
+    return;
+  }
+
+  if (message.action === "setElevenLabsConfig") {
+    elevenLabsKey = message.elevenLabsKey ?? elevenLabsKey;
+    elevenLabsVoiceId = message.elevenLabsVoiceId ?? elevenLabsVoiceId;
+    useElevenLabs = Boolean(message.useElevenLabs);
+    elevenLabsBlockedReason = null;
+    sendResponse({
+      elevenLabsKey: !!elevenLabsKey,
+      elevenLabsVoiceId,
+      useElevenLabs,
+    });
+    return;
+  }
+
   if (message.action === "queryState") {
-    sendResponse({ enabled: isEnabled });
+    sendResponse({
+      enabled: isEnabled,
+      speechRate,
+      speechLang,
+      forcedVoiceName,
+      useElevenLabs,
+    });
     return;
   }
 
@@ -805,10 +1475,20 @@ function handleMessage(message: any, _sender: any, sendResponse: any) {
 
 chrome.runtime.onMessage.addListener(handleMessage);
 
+if (chrome?.storage?.onChanged) {
+  chrome.storage.onChanged.addListener((changes: any, areaName: string) => {
+    if (areaName !== "local" || !changes.speechRate) {
+      return;
+    }
+
+    applySpeechRate(changes.speechRate.newValue ?? SPEECH_RATE_DEFAULT);
+  });
+}
+
 window.addEventListener("mousemove", handleMouseMove, true);
 window.addEventListener("keydown", handleKeyDown, true);
 window.addEventListener("scroll", refreshHighlight, true);
 window.addEventListener("resize", refreshHighlight);
 
-loadAiConfig();
+loadSettings();
 updateState(false);
