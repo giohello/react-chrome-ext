@@ -14,5 +14,10 @@
       "js": ["assets/content.js"],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "icons": {
+    "16": "ai_glasses.png",
+    "48": "ai_glasses.png",
+    "128": "ai_glasses.png"
+  }
 }
