@@ -1,12 +1,14 @@
-export const SPEECH_RATE_MIN = 0.5;
-export const SPEECH_RATE_MAX = 2.5;
-export const SPEECH_RATE_DEFAULT = 1;
-export const SPEECH_RATE_STEP = 0.1;
+export {
+  SPEECH_RATE_MIN,
+  SPEECH_RATE_MAX,
+  SPEECH_RATE_DEFAULT,
+  SPEECH_RATE_STEP,
+} from "./constants";
 
 export function clampSpeechRate(rate: number): number {
   return (
     Math.round(
-      Math.min(SPEECH_RATE_MAX, Math.max(SPEECH_RATE_MIN, rate)) * 10,
+      Math.min(2.5, Math.max(0.5, rate)) * 10,
     ) / 10
   );
 }

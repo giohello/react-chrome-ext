@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { translations } from "./translations";
 import type { LanguageCode } from "./translations";
 import { LANGUAGES, DEFAULT_LANGUAGE_CODE } from "../languages";
+import { STORAGE_KEYS } from "../constants";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const chromeApi = (window as any).chrome;
@@ -15,7 +16,7 @@ export function useTranslation() {
       return;
     }
 
-    chromeApi.storage.local.get(["uiLanguage"], (result: Record<string, unknown>) => {
+    chromeApi.storage.local.get([STORAGE_KEYS.uiLanguage], (result: Record<string, unknown>) => {
       const savedLang = result.uiLanguage as string | undefined;
       if (savedLang && savedLang in translations) {
         setUiLanguage(savedLang as LanguageCode);
@@ -50,7 +51,7 @@ export function useTranslation() {
     }
 
     await new Promise<void>((resolve) => {
-      chromeApi.storage.local.set({ uiLanguage: langCode }, () => {
+      chromeApi.storage.local.set({ [STORAGE_KEYS.uiLanguage]: langCode }, () => {
         resolve();
       });
     });

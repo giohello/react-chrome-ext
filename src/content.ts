@@ -1,8 +1,61 @@
+/**
+ * Content script – injected into every page.
+ *
+ * Architecture notes
+ * ──────────────────
+ * • Speech engine selection uses a simple Strategy pattern: `announce()`
+ *   picks from three paths (exact local voice → ElevenLabs cloud → omnivorous
+ *   fallback) without nesting them inside each other.
+ * • Chrome message dispatch uses a Command map (Record<action, handler>)
+ *   instead of a long if-chain, making it trivial to add or remove actions.
+ * • Constants that are also used by the popup live in constants.ts; the ones
+ *   below are private to the content script.
+ */
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
 type LanguageOption = {
   code: string;
   label: string;
   aiName: string;
 };
+
+type DescriptionData = {
+  role: string;
+  label?: string;
+  alt?: string;
+  type?: string;
+  placeholder?: string;
+  value?: string;
+  link?: string;
+  text?: string;
+  tag: string;
+};
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+// NOTE: these duplicate values from constants.ts intentionally — content
+// scripts are bundled separately and cannot share modules with the popup at
+// runtime. When changing these values, update constants.ts too.
+
+const SPEECH_RATE_MIN = 0.5;
+const SPEECH_RATE_MAX = 2.5;
+const SPEECH_RATE_DEFAULT = 1;
+const SPEECH_RATE_STEP = 0.1;
+const DEFAULT_ELEVENLABS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // ElevenLabs "Rachel"
+const DEFAULT_GEMINI_DAILY_LIMIT = 20;
+const AI_DWELL_MS = 500;
+const AI_MIN_INTERVAL_MS = 4_000;
+const ELEVENLABS_DEBOUNCE_MS = 250;
+
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "textarea:not([disabled])",
+  "select:not([disabled])",
+  "details",
+  '[tabindex]:not([tabindex="-1"])',
+].join(", ");
 
 const LANGUAGES: LanguageOption[] = [
   { code: "en-US", label: "English", aiName: "English" },
@@ -15,8 +68,7 @@ const LANGUAGES: LanguageOption[] = [
   { code: "ar-SA", label: "Arabic (العربية)", aiName: "Arabic" },
   { code: "zh-CN", label: "Chinese (中文)", aiName: "Chinese" },
   { code: "ja-JP", label: "Japanese (日本語)", aiName: "Japanese" },
-  // Not selectable in the popup, but recognized so speech-language
-  // auto-detection can name them correctly in notices.
+  // Not selectable in the popup, but recognized for script-based auto-detection.
   { code: "ko-KR", label: "Korean (한국어)", aiName: "Korean" },
   { code: "el-GR", label: "Greek (Ελληνικά)", aiName: "Greek" },
   { code: "he-IL", label: "Hebrew (עברית)", aiName: "Hebrew" },
@@ -26,19 +78,76 @@ const LANGUAGES: LanguageOption[] = [
 
 const DEFAULT_LANGUAGE_CODE = "en-US";
 
+const ROLE_LABEL_MAP: Record<string, string> = {
+  a: "link", button: "button", link: "link",
+  textbox: "input field", input: "input field", textarea: "text area",
+  select: "drop-down menu", checkbox: "checkbox", radio: "radio button",
+  img: "image", image: "image",
+  navigation: "navigation section", search: "search box",
+  h1: "heading 1", h2: "heading 2", h3: "heading 3",
+  h4: "heading 4", h5: "heading 5", h6: "heading 6",
+  p: "paragraph", span: "text", div: "section",
+  section: "section", article: "article", nav: "navigation",
+  header: "header", footer: "footer", main: "main content", aside: "sidebar",
+  ul: "list", ol: "numbered list", li: "list item",
+  dl: "definition list", dt: "definition term", dd: "definition",
+  table: "table", tr: "table row", td: "table cell", th: "table header cell",
+  thead: "table header", tbody: "table body", tfoot: "table footer",
+  form: "form", fieldset: "field group", legend: "label", label: "label",
+  audio: "audio player", video: "video player", canvas: "canvas",
+  svg: "graphic", blockquote: "quote", code: "code", pre: "code block",
+  strong: "emphasized text", em: "emphasized text",
+  b: "bold text", i: "italic text",
+};
+
+// ─── Mutable state ───────────────────────────────────────────────────────────
+
+const chrome = (window as any).chrome;
+let isEnabled = false;
+let currentTarget: Element | null = null;
+let focusIndex = -1;
+let aiEnabled = false;
+let geminiKey = "";
+let speechRate = SPEECH_RATE_DEFAULT;
+let speechLang = DEFAULT_LANGUAGE_CODE;
+let forcedVoiceName = "";
+let hoverTimer: number | null = null;
+let hoverToken = 0;
+let aiRateLimitedUntil = 0;
+let rateLimitNoticeActive = false;
+let lastAiCallAt = 0;
+let elevenLabsKey = "";
+let elevenLabsVoiceId = DEFAULT_ELEVENLABS_VOICE_ID;
+let useElevenLabs = false;
+let geminiDailyLimit = DEFAULT_GEMINI_DAILY_LIMIT;
+let currentCloudAudio: HTMLAudioElement | null = null;
+let elevenLabsAbortController: AbortController | null = null;
+let elevenLabsDebounceTimer: number | null = null;
+let pendingSpeakTimer: number | null = null;
+// Bumped on every announce() call and on stopSpeech()/disable(). Async
+// continuations capture this generation and bail if it's been superseded.
+let speechGeneration = 0;
+let elevenLabsBlockedReason: string | null = null;
+let voiceMissingWarnedFor: string | null = null;
+
+// ─── DOM overlays (created once, reused) ─────────────────────────────────────
+
+const highlight = createHighlightOverlay();
+const infoPanel = createInfoPanel();
+const liveRegion = createLiveRegion();
+const lastAnnounce = { text: "", timeout: 0 };
+
+// ─── Language helpers ─────────────────────────────────────────────────────────
+
 function getLanguage(code: string): LanguageOption {
   return LANGUAGES.find((lang) => lang.code === code) ?? LANGUAGES[0];
 }
 
-// Detects which language to *speak* text in by looking at the actual
-// Unicode script the text is written in, rather than trusting a
-// configured setting. This matters because the text being spoken (DOM
-// content, or an AI description) isn't necessarily in whatever language
-// the popup's "AI description language" picker is set to — that picker
-// only controls what language Gemini is asked to write descriptions in.
-// Latin-script languages (English, German, Spanish, Turkish, etc.) can't
-// be reliably told apart by script alone, so they all fall back to the
-// default voice — only non-Latin scripts get a confident, specific match.
+/**
+ * Detects the *script* the text is written in and returns the matching BCP-47
+ * code. Latin-script languages can't be told apart by script alone and all
+ * fall back to the default voice; only non-Latin scripts get a specific match.
+ */
 function detectScriptLanguage(text: string): string {
   const scriptRanges: { code: string; test: RegExp }[] = [
     { code: "ka-GE", test: /[\u10A0-\u10FF\u1C90-\u1CBF]/ },
@@ -54,78 +163,14 @@ function detectScriptLanguage(text: string): string {
   ];
 
   for (const { code, test } of scriptRanges) {
-    if (test.test(text)) {
-      return code;
-    }
+    if (test.test(text)) return code;
   }
-
   return DEFAULT_LANGUAGE_CODE;
 }
 
-const chrome = (window as any).chrome;
-let isEnabled = false;
-let currentTarget: Element | null = null;
-let focusIndex = -1;
-let aiEnabled = false;
-let geminiKey = "";
-const SPEECH_RATE_MIN = 0.5;
-const SPEECH_RATE_MAX = 2.5;
-const SPEECH_RATE_DEFAULT = 1;
-const SPEECH_RATE_STEP = 0.1;
-let speechRate = SPEECH_RATE_DEFAULT;
-let speechLang = DEFAULT_LANGUAGE_CODE;
-let forcedVoiceName: string = "";
-let hoverTimer: number | null = null;
-let hoverToken = 0;
-const AI_DWELL_MS = 500;
-let aiRateLimitedUntil = 0;
-let rateLimitNoticeActive = false;
-let lastAiCallAt = 0;
-const AI_MIN_INTERVAL_MS = 4000; // never fire more than one AI call this often
-let elevenLabsKey = "";
-let elevenLabsVoiceId = "21m00Tcm4TlvDq8ikWAM"; // ElevenLabs' default "Rachel" premade voice
-let useElevenLabs = false;
-let geminiDailyLimit = 20; // updated automatically if Gemini reports a different limit
-let currentCloudAudio: HTMLAudioElement | null = null;
-let elevenLabsAbortController: AbortController | null = null;
-let elevenLabsDebounceTimer: number | null = null;
-const ELEVENLABS_DEBOUNCE_MS = 250;
-let pendingSpeakTimer: number | null = null;
-// Bumped on every new announce() call (and on stopSpeech/disable). Async
-// continuations — the cloud TTS fallback, the delayed local-speak timer —
-// capture the generation they belong to and check it before actually
-// producing audio, so a slow/failed call that's been superseded by a
-// newer hover never gets to speak after the fact.
-let speechGeneration = 0;
+// ─── DOM overlay factories ───────────────────────────────────────────────────
 
-function clampSpeechRate(rate: number) {
-  return (
-    Math.round(
-      Math.min(SPEECH_RATE_MAX, Math.max(SPEECH_RATE_MIN, rate)) * 10,
-    ) / 10
-  );
-}
-
-function formatSpeechRate(rate: number) {
-  return rate.toFixed(1);
-}
-
-const highlight = createHighlightOverlay();
-const infoPanel = createInfoPanel();
-const liveRegion = createLiveRegion();
-const lastAnnounce = { text: "", timeout: 0 };
-
-const FOCUSABLE_SELECTOR = [
-  "a[href]",
-  "button:not([disabled])",
-  "input:not([disabled])",
-  "textarea:not([disabled])",
-  "select:not([disabled])",
-  "details",
-  '[tabindex]:not([tabindex="-1"])',
-].join(", ");
-
-function createHighlightOverlay() {
+function createHighlightOverlay(): HTMLDivElement {
   const overlay = document.createElement("div");
   overlay.style.cssText = [
     "position:fixed",
@@ -141,7 +186,7 @@ function createHighlightOverlay() {
   return overlay;
 }
 
-function createInfoPanel() {
+function createInfoPanel(): HTMLDivElement {
   const panel = document.createElement("div");
   panel.style.cssText = [
     "position:fixed",
@@ -160,13 +205,12 @@ function createInfoPanel() {
     "display:none",
     "white-space:pre-wrap",
   ].join(";");
-  panel.textContent =
-    "Blind Helper is ready. Enable the extension from the popup.";
+  panel.textContent = "Blind Helper is ready. Enable the extension from the popup.";
   document.documentElement.appendChild(panel);
   return panel;
 }
 
-function createLiveRegion() {
+function createLiveRegion(): HTMLDivElement {
   const region = document.createElement("div");
   region.setAttribute("aria-live", "polite");
   region.setAttribute("aria-atomic", "true");
@@ -186,19 +230,9 @@ function createLiveRegion() {
   return region;
 }
 
-type DescriptionData = {
-  role: string;
-  label?: string;
-  alt?: string;
-  type?: string;
-  placeholder?: string;
-  value?: string;
-  link?: string;
-  text?: string;
-  tag: string;
-};
+// ─── Element description ─────────────────────────────────────────────────────
 
-function describeElement(element: Element | null) {
+function describeElement(element: Element | null): string {
   if (!element) {
     return JSON.stringify({ role: "unknown", tag: "unknown" });
   }
@@ -227,8 +261,7 @@ function describeElement(element: Element | null) {
   const type = element instanceof HTMLInputElement ? element.type : "";
 
   const data: DescriptionData = {
-    role,
-    tag,
+    role, tag,
     label: label || undefined,
     alt: alt || undefined,
     type: type || undefined,
@@ -241,26 +274,21 @@ function describeElement(element: Element | null) {
   return JSON.stringify(data);
 }
 
-function getTextFromLabelledBy(element: Element) {
+function getTextFromLabelledBy(element: Element): string {
   const labelledBy = element.getAttribute("aria-labelledby");
-  if (!labelledBy) {
-    return "";
-  }
-  return Array.from(labelledBy.split(" "))
+  if (!labelledBy) return "";
+  return labelledBy
+    .split(" ")
     .map((id) => document.getElementById(id)?.textContent?.trim() || "")
     .filter(Boolean)
     .join(" ");
 }
 
 function getTextFromNearbyElement(element: Element): string {
-  if (!(element instanceof HTMLElement)) {
-    return "";
-  }
+  if (!(element instanceof HTMLElement)) return "";
 
   const rect = element.getBoundingClientRect();
-  if (rect.width === 0 || rect.height === 0) {
-    return "";
-  }
+  if (rect.width === 0 || rect.height === 0) return "";
 
   const points = [
     { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
@@ -271,69 +299,48 @@ function getTextFromNearbyElement(element: Element): string {
   ];
 
   for (const point of points) {
-    const elements = document.elementsFromPoint(point.x, point.y);
-    for (const candidate of elements) {
-      if (candidate === element) {
-        continue;
-      }
-      if (!(candidate instanceof HTMLElement)) {
-        continue;
-      }
-      if (!isVisible(candidate)) {
-        continue;
-      }
-      const candidateText = candidate.textContent?.trim() || "";
-      if (candidateText.length > 1) {
-        return candidateText;
-      }
+    for (const candidate of document.elementsFromPoint(point.x, point.y)) {
+      if (candidate === element) continue;
+      if (!(candidate instanceof HTMLElement)) continue;
+      if (!isVisible(candidate)) continue;
+      const text = candidate.textContent?.trim() || "";
+      if (text.length > 1) return text;
     }
   }
-
   return "";
 }
 
 function getTextFromNearestTextContainer(element: Element): string {
-  if (!(element instanceof HTMLElement)) {
-    return "";
-  }
-
+  if (!(element instanceof HTMLElement)) return "";
   let current: HTMLElement | null = element;
   while (current) {
     const text = current.textContent?.trim() || "";
-    if (text.length > 1) {
-      return text;
-    }
+    if (text.length > 1) return text;
     current = current.parentElement;
   }
-
   return "";
 }
 
 function getRenderedText(element: Element): string {
-  if (!(element instanceof HTMLElement)) {
-    return "";
-  }
-
+  if (!(element instanceof HTMLElement)) return "";
   const text = element.innerText?.trim() || "";
-  if (text.length > 1) {
-    return text;
-  }
-
-  return element.textContent?.trim() || "";
+  return text.length > 1 ? text : (element.textContent?.trim() || "");
 }
 
-function getFriendlyDescription(rawDescription: string) {
+function getFriendlyDescription(rawDescription: string): string {
   let fields: Record<string, string> = {};
 
   try {
     const parsed = JSON.parse(rawDescription) as DescriptionData;
-    fields = Object.keys(parsed).reduce<Record<string, string>>((acc, key) => {
-      const value = (parsed as any)[key];
-      if (typeof value === "string" && value.trim()) {
-        acc[key] = value.trim();
-      }
-      return acc;
-    }, {});
+    fields = Object.entries(parsed).reduce<Record<string, string>>(
+      (acc, [key, value]) => {
+        if (typeof value === "string" && value.trim()) {
+          acc[key] = value.trim();
+        }
+        return acc;
+      },
+      {},
+    );
   } catch {
     fields = rawDescription
       .split(", ")
@@ -348,77 +355,10 @@ function getFriendlyDescription(rawDescription: string) {
       }, {});
   }
 
-  const role = fields.role || "item";
-  const label = fields.label;
-  const alt = fields.alt;
-  const placeholder = fields.placeholder;
-  const value = fields.value;
-  const href = fields.link;
-  const text = fields.text;
-
+  const { role = "item", label, alt, placeholder, value, link: href, text } = fields;
   const pieces: string[] = [];
 
-  const roleMap: Record<string, string> = {
-    a: "link",
-    button: "button",
-    link: "link",
-    textbox: "input field",
-    input: "input field",
-    textarea: "text area",
-    select: "drop-down menu",
-    checkbox: "checkbox",
-    radio: "radio button",
-    img: "image",
-    image: "image",
-    navigation: "navigation section",
-    search: "search box",
-    h1: "heading 1",
-    h2: "heading 2",
-    h3: "heading 3",
-    h4: "heading 4",
-    h5: "heading 5",
-    h6: "heading 6",
-    p: "paragraph",
-    span: "text",
-    div: "section",
-    section: "section",
-    article: "article",
-    nav: "navigation",
-    header: "header",
-    footer: "footer",
-    main: "main content",
-    aside: "sidebar",
-    ul: "list",
-    ol: "numbered list",
-    li: "list item",
-    dl: "definition list",
-    dt: "definition term",
-    dd: "definition",
-    table: "table",
-    tr: "table row",
-    td: "table cell",
-    th: "table header cell",
-    thead: "table header",
-    tbody: "table body",
-    tfoot: "table footer",
-    form: "form",
-    fieldset: "field group",
-    legend: "label",
-    label: "label",
-    audio: "audio player",
-    video: "video player",
-    canvas: "canvas",
-    svg: "graphic",
-    blockquote: "quote",
-    code: "code",
-    pre: "code block",
-    strong: "emphasized text",
-    em: "emphasized text",
-    b: "bold text",
-    i: "italic text",
-  };
-
-  pieces.push(roleMap[role.toLowerCase()] || roleMap[role] || "page item");
+  pieces.push(ROLE_LABEL_MAP[role.toLowerCase()] || "page item");
 
   if (label) {
     pieces.push(`labeled ${label}`);
@@ -433,7 +373,6 @@ function getFriendlyDescription(rawDescription: string) {
   if (href && (role === "link" || role === "a" || role === "A")) {
     pieces.push(`link to ${href}`);
   }
-
   if (value && !label && !text && role.includes("input")) {
     pieces.push(`currently ${value}`);
   }
@@ -441,27 +380,19 @@ function getFriendlyDescription(rawDescription: string) {
   return pieces.join(" ").replace(/\s+/g, " ").trim() || rawDescription;
 }
 
-function getBackgroundImageUrl(element: Element): string | null {
-  const style = window.getComputedStyle(element);
-  const backgroundImage = style.backgroundImage;
-  if (!backgroundImage || backgroundImage === "none") {
-    return null;
-  }
+// ─── Visual / image helpers ──────────────────────────────────────────────────
 
-  const match = backgroundImage.match(/url\(["']?(.*?)["']?\)/);
+function getBackgroundImageUrl(element: Element): string | null {
+  const bg = window.getComputedStyle(element).backgroundImage;
+  if (!bg || bg === "none") return null;
+  const match = bg.match(/url\(["']?(.*?)["']?\)/);
   return match ? match[1] : null;
 }
 
-function isVisualElement(element: Element) {
-  if (!element) {
-    return false;
-  }
-
+function isVisualElement(element: Element): boolean {
+  if (!element) return false;
   const tag = element.tagName.toLowerCase();
-  if (tag === "img" || tag === "canvas" || tag === "svg" || tag === "video") {
-    return true;
-  }
-
+  if (["img", "canvas", "svg", "video"].includes(tag)) return true;
   return Boolean(getBackgroundImageUrl(element));
 }
 
@@ -469,10 +400,10 @@ async function getBase64FromUrl(url: string): Promise<string | null> {
   try {
     const response = await fetch(url);
     const blob = await response.blob();
-    return await blobToBase64(blob);
+    return blobToBase64(blob);
   } catch (err) {
     console.error(
-      "Failed to fetch visual asset (likely a CORS restriction on this image's server):",
+      "Failed to fetch visual asset (likely a CORS restriction):",
       err,
     );
     updateInfo(
@@ -484,270 +415,10 @@ async function getBase64FromUrl(url: string): Promise<string | null> {
 
 function serializeSvg(element: SVGElement): string | null {
   try {
-    const serializer = new XMLSerializer();
-    return serializer.serializeToString(element);
+    return new XMLSerializer().serializeToString(element);
   } catch (err) {
     console.error("SVG serialization failed:", err);
     return null;
-  }
-}
-
-function extractQuotaValue(errorBody: string): number | null {
-  try {
-    const parsed = JSON.parse(errorBody);
-    const details = parsed?.error?.details;
-    if (!Array.isArray(details)) return null;
-    const quotaFailure = details.find((d: any) =>
-      String(d["@type"] || "").includes("QuotaFailure"),
-    );
-    const value = quotaFailure?.violations?.[0]?.quotaValue;
-    const parsedValue = parseInt(value, 10);
-    return Number.isFinite(parsedValue) ? parsedValue : null;
-  } catch {
-    return null;
-  }
-}
-
-// Gemini's API doesn't expose remaining quota anywhere, so we track our own
-// call history locally and estimate usage against the last known daily
-// limit. This is an estimate, not a guarantee — Google's actual reset timing
-// may not align exactly with a rolling 24h window.
-function recordGeminiCall() {
-  if (!chrome?.storage?.local) return;
-  chrome.storage.local.get(["geminiCallLog"], (result: any) => {
-    const now = Date.now();
-    const oneDayAgo = now - 24 * 60 * 60 * 1000;
-    const log: number[] = Array.isArray(result.geminiCallLog)
-      ? result.geminiCallLog
-      : [];
-    const pruned = log.filter((t) => t > oneDayAgo);
-    pruned.push(now);
-    chrome.storage.local.set({ geminiCallLog: pruned });
-  });
-}
-
-function persistRateLimitState() {
-  if (!chrome?.storage?.local) return;
-  chrome.storage.local.set({
-    aiRateLimitedUntil,
-    geminiDailyLimit,
-  });
-}
-
-function extractRetryDelayMs(errorBody: string): number | null {
-  try {
-    const parsed = JSON.parse(errorBody);
-    const details = parsed?.error?.details;
-    if (!Array.isArray(details)) return null;
-    const retryInfo = details.find((d: any) =>
-      String(d["@type"] || "").includes("RetryInfo"),
-    );
-    const retryDelay = retryInfo?.retryDelay; // e.g. "21s"
-    if (typeof retryDelay !== "string") return null;
-    const seconds = parseFloat(retryDelay.replace("s", ""));
-    return Number.isFinite(seconds) ? Math.ceil(seconds * 1000) : null;
-  } catch {
-    return null;
-  }
-}
-
-async function analyzeVisualElementWithVision(
-  element: Element,
-  rawDescription: string,
-): Promise<string> {
-  console.log(
-    "[Vision] Starting analysis. aiEnabled:",
-    aiEnabled,
-    "hasKey:",
-    !!geminiKey,
-    "isVisual:",
-    isVisualElement(element),
-  );
-
-  if (!aiEnabled || !geminiKey || !isVisualElement(element)) {
-    console.log(
-      "[Vision] Skipping: aiEnabled=",
-      aiEnabled,
-      "geminiKey=",
-      !!geminiKey,
-      "isVisual=",
-      isVisualElement(element),
-    );
-    return rawDescription;
-  }
-
-  if (Date.now() < aiRateLimitedUntil) {
-    console.log(
-      "[Vision] Skipping: still rate-limited for",
-      Math.ceil((aiRateLimitedUntil - Date.now()) / 1000),
-      "more seconds",
-    );
-    return rawDescription;
-  }
-
-  if (Date.now() - lastAiCallAt < AI_MIN_INTERVAL_MS) {
-    console.log("[Vision] Skipping: calling AI too frequently, back off a bit");
-    return rawDescription;
-  }
-  lastAiCallAt = Date.now();
-  recordGeminiCall();
-
-  try {
-    let imageData: string | null = null;
-    let mediaType = "image/jpeg";
-
-    const tag = element.tagName.toLowerCase();
-
-    if (tag === "img") {
-      const img = element as HTMLImageElement;
-      const src = img.currentSrc || img.src;
-      if (src) {
-        imageData = await getBase64FromUrl(src);
-      }
-    } else if (tag === "canvas") {
-      const canvas = element as HTMLCanvasElement;
-      imageData = canvas.toDataURL("image/png");
-      mediaType = "image/png";
-    } else if (tag === "svg") {
-      const svg = element as SVGElement;
-      const svgString = serializeSvg(svg);
-      if (svgString) {
-        const encoded = window.btoa(unescape(encodeURIComponent(svgString)));
-        imageData = `data:image/svg+xml;base64,${encoded}`;
-        mediaType = "image/svg+xml";
-      }
-    } else if (tag === "video") {
-      const video = element as HTMLVideoElement;
-      const poster = video.poster;
-      if (poster) {
-        imageData = await getBase64FromUrl(poster);
-      }
-    }
-
-    if (!imageData) {
-      const bgUrl = getBackgroundImageUrl(element);
-      if (bgUrl) {
-        const base64 = await getBase64FromUrl(bgUrl);
-        if (base64) {
-          imageData = base64;
-          mediaType = "image/png";
-        }
-      }
-    }
-
-    if (!imageData) {
-      return rawDescription;
-    }
-
-    if (imageData.startsWith("data:")) {
-      const parts = imageData.split(",");
-      if (parts.length === 2) {
-        const meta = parts[0];
-        mediaType = meta.split(";")[0].replace("data:", "") || mediaType;
-        imageData = parts[1];
-      }
-    }
-
-    const payload = {
-      contents: [
-        {
-          parts: [
-            {
-              text: `Describe this visual content in one or two sentences, in ${getLanguage(speechLang).aiName}. Be concise and focus on what is visible. Respond only in ${getLanguage(speechLang).aiName}, with no English unless that is the element's actual text.`,
-            },
-            {
-              inline_data: {
-                mime_type: mediaType,
-                data: imageData,
-              },
-            },
-          ],
-        },
-      ],
-    };
-
-    console.log(
-      "[Vision] Sending to Google Gemini. Key preview:",
-      geminiKey.substring(0, 10) + "...",
-    );
-
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(geminiKey)}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      },
-    );
-
-    if (!response.ok) {
-      const body = await response.text();
-      console.error("[Vision] API error status:", response.status);
-      console.error("[Vision] API error body:", body);
-
-      if (response.status === 429) {
-        const retryMs = extractRetryDelayMs(body) ?? 30000;
-        aiRateLimitedUntil = Date.now() + retryMs;
-        const reportedLimit = extractQuotaValue(body);
-        if (reportedLimit) {
-          geminiDailyLimit = reportedLimit;
-        }
-        persistRateLimitState();
-
-        if (!rateLimitNoticeActive) {
-          rateLimitNoticeActive = true;
-          const seconds = Math.ceil(retryMs / 1000);
-          const notice = `AI image descriptions paused: Gemini's free daily quota is used up. Using basic descriptions for about ${seconds} seconds, or until tomorrow if the quota resets daily.`;
-          updateInfo(notice);
-          announce(notice);
-          window.setTimeout(() => {
-            rateLimitNoticeActive = false;
-            persistRateLimitState();
-          }, retryMs);
-        }
-      } else {
-        updateInfo(`Vision failed (${response.status}). Check console.`);
-      }
-
-      return rawDescription;
-    }
-
-    console.log("[Vision] Got response, parsing...");
-    const data = await response.json();
-    console.log(
-      "[Vision] Response data:",
-      JSON.stringify(data).substring(0, 300) + "...",
-    );
-
-    let resultText = "";
-
-    if (
-      data.candidates &&
-      data.candidates[0] &&
-      data.candidates[0].content &&
-      data.candidates[0].content.parts
-    ) {
-      const parts = data.candidates[0].content.parts;
-      for (const part of parts) {
-        if (part.text) {
-          resultText += part.text;
-        }
-      }
-    }
-
-    if (resultText.trim()) {
-      console.log("[Vision] Success. Text:", resultText.substring(0, 100));
-      return resultText.trim();
-    }
-
-    console.log("[Vision] No text extracted from response");
-    updateInfo("Gemini responded but no text was extracted.");
-    return rawDescription;
-  } catch (err) {
-    console.error("Vision analysis error:", err);
-    return rawDescription;
   }
 }
 
@@ -760,28 +431,211 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
-function updateInfo(text: string) {
+// ─── Gemini rate-limit / quota tracking ──────────────────────────────────────
+
+function extractQuotaValue(errorBody: string): number | null {
+  try {
+    const details = JSON.parse(errorBody)?.error?.details;
+    if (!Array.isArray(details)) return null;
+    const violation = details
+      .find((d: any) => String(d["@type"] || "").includes("QuotaFailure"))
+      ?.violations?.[0]?.quotaValue;
+    const n = parseInt(violation, 10);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractRetryDelayMs(errorBody: string): number | null {
+  try {
+    const details = JSON.parse(errorBody)?.error?.details;
+    if (!Array.isArray(details)) return null;
+    const delay = details.find((d: any) =>
+      String(d["@type"] || "").includes("RetryInfo"),
+    )?.retryDelay; // e.g. "21s"
+    if (typeof delay !== "string") return null;
+    const seconds = parseFloat(delay.replace("s", ""));
+    return Number.isFinite(seconds) ? Math.ceil(seconds * 1000) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Gemini's API doesn't expose remaining quota, so we track our own call
+ * history locally and estimate against the last known daily limit.
+ */
+function recordGeminiCall(): void {
+  if (!chrome?.storage?.local) return;
+  chrome.storage.local.get(["geminiCallLog"], (result: any) => {
+    const now = Date.now();
+    const oneDayAgo = now - 24 * 60 * 60 * 1000;
+    const log: number[] = Array.isArray(result.geminiCallLog)
+      ? result.geminiCallLog
+      : [];
+    const pruned = [...log.filter((t) => t > oneDayAgo), now];
+    chrome.storage.local.set({ geminiCallLog: pruned });
+  });
+}
+
+function persistRateLimitState(): void {
+  if (!chrome?.storage?.local) return;
+  chrome.storage.local.set({ aiRateLimitedUntil, geminiDailyLimit });
+}
+
+// ─── Gemini vision ───────────────────────────────────────────────────────────
+
+async function analyzeVisualElementWithVision(
+  element: Element,
+  rawDescription: string,
+): Promise<string> {
+  if (!aiEnabled || !geminiKey || !isVisualElement(element)) {
+    return rawDescription;
+  }
+  if (Date.now() < aiRateLimitedUntil) {
+    return rawDescription;
+  }
+  if (Date.now() - lastAiCallAt < AI_MIN_INTERVAL_MS) {
+    return rawDescription;
+  }
+
+  lastAiCallAt = Date.now();
+  recordGeminiCall();
+
+  try {
+    const { imageData, mediaType } = await extractImageData(element);
+    if (!imageData) return rawDescription;
+
+    const lang = getLanguage(speechLang).aiName;
+    const payload = {
+      contents: [
+        {
+          parts: [
+            {
+              text: `Describe this visual content in one or two sentences, in ${lang}. Be concise and focus on what is visible. Respond only in ${lang}, with no English unless that is the element's actual text.`,
+            },
+            { inline_data: { mime_type: mediaType, data: imageData } },
+          ],
+        },
+      ],
+    };
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(geminiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+    );
+
+    if (!response.ok) {
+      const body = await response.text();
+      console.error("[Vision] API error:", response.status, body);
+      handleGeminiError(response.status, body);
+      return rawDescription;
+    }
+
+    const data = await response.json();
+    const resultText = (data.candidates?.[0]?.content?.parts ?? [])
+      .map((part: any) => part.text || "")
+      .join("")
+      .trim();
+
+    return resultText || rawDescription;
+  } catch (err) {
+    console.error("Vision analysis error:", err);
+    return rawDescription;
+  }
+}
+
+async function extractImageData(
+  element: Element,
+): Promise<{ imageData: string | null; mediaType: string }> {
+  let imageData: string | null = null;
+  let mediaType = "image/jpeg";
+  const tag = element.tagName.toLowerCase();
+
+  if (tag === "img") {
+    const src = (element as HTMLImageElement).currentSrc || (element as HTMLImageElement).src;
+    if (src) imageData = await getBase64FromUrl(src);
+  } else if (tag === "canvas") {
+    imageData = (element as HTMLCanvasElement).toDataURL("image/png");
+    mediaType = "image/png";
+  } else if (tag === "svg") {
+    const svgString = serializeSvg(element as SVGElement);
+    if (svgString) {
+      imageData = `data:image/svg+xml;base64,${window.btoa(unescape(encodeURIComponent(svgString)))}`;
+      mediaType = "image/svg+xml";
+    }
+  } else if (tag === "video") {
+    const poster = (element as HTMLVideoElement).poster;
+    if (poster) imageData = await getBase64FromUrl(poster);
+  }
+
+  if (!imageData) {
+    const bgUrl = getBackgroundImageUrl(element);
+    if (bgUrl) {
+      const base64 = await getBase64FromUrl(bgUrl);
+      if (base64) { imageData = base64; mediaType = "image/png"; }
+    }
+  }
+
+  // Strip the data: URL prefix — Gemini wants raw base64
+  if (imageData?.startsWith("data:")) {
+    const [meta, data] = imageData.split(",");
+    if (data) {
+      mediaType = meta.split(";")[0].replace("data:", "") || mediaType;
+      imageData = data;
+    }
+  }
+
+  return { imageData, mediaType };
+}
+
+function handleGeminiError(status: number, body: string): void {
+  if (status === 429) {
+    const retryMs = extractRetryDelayMs(body) ?? 30_000;
+    aiRateLimitedUntil = Date.now() + retryMs;
+    const reportedLimit = extractQuotaValue(body);
+    if (reportedLimit) geminiDailyLimit = reportedLimit;
+    persistRateLimitState();
+
+    if (!rateLimitNoticeActive) {
+      rateLimitNoticeActive = true;
+      const seconds = Math.ceil(retryMs / 1000);
+      const notice = `AI image descriptions paused: Gemini's free daily quota is used up. Using basic descriptions for about ${seconds} seconds, or until tomorrow if the quota resets daily.`;
+      updateInfo(notice);
+      announce(notice);
+      window.setTimeout(() => {
+        rateLimitNoticeActive = false;
+        persistRateLimitState();
+      }, retryMs);
+    }
+  } else {
+    updateInfo(`Vision failed (${status}). Check console.`);
+  }
+}
+
+// ─── Speech ──────────────────────────────────────────────────────────────────
+
+function updateInfo(text: string): void {
   infoPanel.textContent = text;
   liveRegion.textContent = text;
 }
 
-function stopSpeech() {
-  if ("speechSynthesis" in window) {
-    window.speechSynthesis.cancel();
-  }
-  if (currentCloudAudio) {
-    currentCloudAudio.pause();
-    currentCloudAudio = null;
-  }
-  if (elevenLabsAbortController) {
-    elevenLabsAbortController.abort();
-    elevenLabsAbortController = null;
-  }
+function stopSpeech(): void {
+  window.speechSynthesis?.cancel();
+  currentCloudAudio?.pause();
+  currentCloudAudio = null;
+  elevenLabsAbortController?.abort();
+  elevenLabsAbortController = null;
   if (elevenLabsDebounceTimer) {
     window.clearTimeout(elevenLabsDebounceTimer);
     elevenLabsDebounceTimer = null;
   }
-  speechGeneration++; // invalidate any pending debounced/delayed speech
+  speechGeneration++; // invalidate any pending async speech
   if (pendingSpeakTimer) {
     window.clearTimeout(pendingSpeakTimer);
     pendingSpeakTimer = null;
@@ -792,73 +646,35 @@ function stopSpeech() {
   }
 }
 
-// Only returns a voice that actually claims to support this language
-// (exact or base-language match). Returns undefined if there's no real
-// local support — callers use that to decide whether to reach for a
-// cloud voice instead of guessing with a fallback.
-function pickExactVoiceForLanguage(
-  lang: string,
-): SpeechSynthesisVoice | undefined {
-  if (!("speechSynthesis" in window)) {
-    return undefined;
-  }
+/** Returns a voice that actually claims to support `lang`, or undefined. */
+function pickExactVoiceForLanguage(lang: string): SpeechSynthesisVoice | undefined {
+  if (!("speechSynthesis" in window)) return undefined;
   const voices = window.speechSynthesis.getVoices();
-  if (voices.length === 0) {
-    return undefined;
-  }
+  if (voices.length === 0) return undefined;
   const exact = voices.find((v) => v.lang === lang);
   if (exact) return exact;
   const base = lang.split("-")[0];
-  return voices.find((v) =>
-    v.lang.toLowerCase().startsWith(base.toLowerCase()),
-  );
+  return voices.find((v) => v.lang.toLowerCase().startsWith(base.toLowerCase()));
 }
 
-// Last-resort guess for when there's no real local voice and no cloud
-// voice is available either. Google's network voices use a broader
-// multilingual model and will generally attempt any script with an
-// accent rather than producing no audio at all — better than nothing,
-// but not a substitute for real support.
+/** Last-resort: Google's multilingual network voices attempt any script. */
 function pickOmnivorousFallbackVoice(): SpeechSynthesisVoice | undefined {
-  if (!("speechSynthesis" in window)) {
-    return undefined;
-  }
-  const voices = window.speechSynthesis.getVoices();
-  return voices.find((v) => v.name.includes("Google"));
+  if (!("speechSynthesis" in window)) return undefined;
+  return window.speechSynthesis.getVoices().find((v) => v.name.includes("Google"));
 }
-
-let voiceMissingWarnedFor: string | null = null;
-
-let elevenLabsBlockedReason: string | null = null;
 
 async function speakWithElevenLabs(text: string): Promise<boolean> {
-  if (!elevenLabsKey || !elevenLabsVoiceId) {
+  if (!elevenLabsKey || !elevenLabsVoiceId || elevenLabsBlockedReason) {
     return false;
   }
 
-  if (elevenLabsBlockedReason) {
-    // We already know this config can't work (e.g. a 401/402 from a voice
-    // ID this account can't use via the API). Don't keep re-hitting the
-    // network on every single hover until the user changes something.
-    return false;
-  }
-
-  // Cancel any previous in-flight request. ElevenLabs caps free accounts
-  // at a couple of concurrent requests — rapid hovering was firing several
-  // overlapping fetches before any of them resolved, which both burned
-  // through that concurrency limit AND looked like abusive traffic to
-  // their systems. A new utterance always supersedes whatever was being
-  // requested before, so there's never a reason to let an old one finish.
-  if (elevenLabsAbortController) {
-    elevenLabsAbortController.abort();
-  }
+  // Cancel any previous in-flight request to avoid concurrency limit hits
+  elevenLabsAbortController?.abort();
   const controller = new AbortController();
   elevenLabsAbortController = controller;
 
-  if (currentCloudAudio) {
-    currentCloudAudio.pause();
-    currentCloudAudio = null;
-  }
+  currentCloudAudio?.pause();
+  currentCloudAudio = null;
 
   try {
     const response = await fetch(
@@ -870,156 +686,94 @@ async function speakWithElevenLabs(text: string): Promise<boolean> {
           "Content-Type": "application/json",
           Accept: "audio/mpeg",
         },
-        body: JSON.stringify({
-          text,
-          model_id: "eleven_multilingual_v2",
-        }),
+        body: JSON.stringify({ text, model_id: "eleven_multilingual_v2" }),
         signal: controller.signal,
       },
     );
 
-    // A newer call (or a disable) superseded this one while we were
-    // waiting on the network — discard the result, it's no longer relevant.
-    if (controller.signal.aborted || !isEnabled) {
-      return false;
-    }
+    if (controller.signal.aborted || !isEnabled) return false;
 
     if (!response.ok) {
       const body = await response.text();
       console.error("[ElevenLabs] API error:", response.status, body);
-
-      if (response.status === 401 || response.status === 402) {
-        // This is an account/permission problem, not a transient one —
-        // retrying on every hover won't help until the user picks a
-        // different voice ID or fixes their plan.
-        elevenLabsBlockedReason = `ElevenLabs voice unavailable (${response.status}). This voice ID isn't usable on your current plan via the API — pick a different voice from "My Voices" in the popup, or add one from the Voice Library to your account first.`;
-        updateInfo(elevenLabsBlockedReason);
-        announce(elevenLabsBlockedReason);
-      } else if (response.status === 429) {
-        // Concurrency/rate limit — transient, just let it fall back to
-        // the local voice for this utterance rather than blocking entirely.
-        updateInfo(
-          `ElevenLabs is rate-limited (429). Falling back to local voice for now.`,
-        );
-      } else {
-        updateInfo(
-          `ElevenLabs voice failed (${response.status}). Falling back to local voice.`,
-        );
-      }
+      handleElevenLabsError(response.status);
       return false;
     }
 
     const blob = await response.blob();
-
-    if (controller.signal.aborted || !isEnabled) {
-      return false;
-    }
+    if (controller.signal.aborted || !isEnabled) return false;
 
     const url = URL.createObjectURL(blob);
     const audio = new Audio(url);
     currentCloudAudio = audio;
     audio.onended = () => {
       URL.revokeObjectURL(url);
-      if (currentCloudAudio === audio) {
-        currentCloudAudio = null;
-      }
+      if (currentCloudAudio === audio) currentCloudAudio = null;
     };
     await audio.play();
     return true;
   } catch (err) {
-    if ((err as any)?.name === "AbortError") {
-      // Expected — a newer utterance or a disable canceled this request.
-      return false;
-    }
+    if ((err as any)?.name === "AbortError") return false;
     console.error("[ElevenLabs] request failed:", err);
     return false;
   }
 }
 
-function announce(text: string, rate = speechRate) {
-  if (!isEnabled) {
-    return;
+function handleElevenLabsError(status: number): void {
+  if (status === 401 || status === 402) {
+    elevenLabsBlockedReason = `ElevenLabs voice unavailable (${status}). This voice ID isn't usable on your current plan via the API — pick a different voice from "My Voices" in the popup, or add one from the Voice Library to your account first.`;
+    updateInfo(elevenLabsBlockedReason);
+    announce(elevenLabsBlockedReason);
+  } else if (status === 429) {
+    updateInfo("ElevenLabs is rate-limited (429). Falling back to local voice for now.");
+  } else {
+    updateInfo(`ElevenLabs voice failed (${status}). Falling back to local voice.`);
   }
+}
+
+/**
+ * Speaks `text` using the best available engine.
+ *
+ * Strategy (in priority order):
+ *  1. Exact local voice for the detected language (free, instant, preferred)
+ *  2. ElevenLabs cloud TTS (when no real local voice exists and configured)
+ *  3. Omnivorous Google network voice (last resort)
+ */
+function announce(text: string, rate = speechRate): void {
+  if (!isEnabled) return;
 
   updateInfo(text);
 
-  // Every new utterance supersedes whatever's currently playing, no matter
-  // which engine produced it. This has to happen unconditionally up front
-  // — not just inside whichever branch we're about to take — otherwise
-  // switching from an element that used the local voice to one that uses
-  // the cloud voice (or vice versa) leaves the old one still talking while
-  // the new one starts.
-  window.speechSynthesis?.cancel();
-  if (currentCloudAudio) {
-    currentCloudAudio.pause();
-    currentCloudAudio = null;
-  }
-  if (elevenLabsAbortController) {
-    elevenLabsAbortController.abort();
-    elevenLabsAbortController = null;
-  }
-  if (elevenLabsDebounceTimer) {
-    window.clearTimeout(elevenLabsDebounceTimer);
-    elevenLabsDebounceTimer = null;
-  }
-  if (pendingSpeakTimer) {
-    window.clearTimeout(pendingSpeakTimer);
-    pendingSpeakTimer = null;
-  }
+  // Cancel everything currently playing before deciding what's next
+  stopSpeech();
 
-  // Tag this call so any async work it kicks off (the cloud-voice debounce,
-  // the delayed local-speak timer, the cloud fallback) can tell whether
-  // it's been superseded by a newer announce() before it actually speaks.
-  const myGeneration = ++speechGeneration;
-
-  // Speak in whatever language the text actually appears to be in, not
-  // whatever the "AI description language" setting is — that setting only
-  // controls what language Gemini writes descriptions in. The DOM text
-  // being read can be in any language regardless.
+  const myGeneration = speechGeneration; // captured *after* stopSpeech increments it
   const detectedLang = detectScriptLanguage(text);
-
   const forcedVoice = forcedVoiceName
-    ? window.speechSynthesis
-        ?.getVoices()
-        .find((v) => v.name === forcedVoiceName)
+    ? window.speechSynthesis?.getVoices().find((v) => v.name === forcedVoiceName)
     : undefined;
-
-  // A manual override always wins outright — it means the user already
-  // confirmed this voice actually produces audio for what they need.
-  const exactLocalVoice =
-    forcedVoice ?? pickExactVoiceForLanguage(detectedLang);
-  const hasRealLocalVoice = !!exactLocalVoice;
+  const exactLocalVoice = forcedVoice ?? pickExactVoiceForLanguage(detectedLang);
+  const hasRealLocalVoice = Boolean(exactLocalVoice);
 
   const speakLocally = (
     voice: SpeechSynthesisVoice | undefined,
-    noticeIfMissing: boolean,
-  ) => {
-    if (!("speechSynthesis" in window)) {
-      return;
-    }
+    warnIfMissing: boolean,
+  ): void => {
+    if (!("speechSynthesis" in window)) return;
 
     const speakNow = () => {
       pendingSpeakTimer = null;
-      if (myGeneration !== speechGeneration || !isEnabled) {
-        // Superseded by a newer hover, or disabled, since this was
-        // scheduled — don't let stale speech start.
-        return;
-      }
+      if (myGeneration !== speechGeneration || !isEnabled) return;
 
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.rate = rate;
       utterance.lang = detectedLang;
-
       if (voice) {
         utterance.voice = voice;
-      } else if (noticeIfMissing && detectedLang !== DEFAULT_LANGUAGE_CODE) {
+      } else if (warnIfMissing && detectedLang !== DEFAULT_LANGUAGE_CODE) {
         if (voiceMissingWarnedFor !== detectedLang) {
           voiceMissingWarnedFor = detectedLang;
           const langName = getLanguage(detectedLang).aiName;
-          console.warn(
-            `[Speech] No installed voice found for ${detectedLang}. Trying anyway with the lang tag set. ` +
-              `Install a system/Chrome voice pack for this language for reliable speech.`,
-          );
           updateInfo(
             `Note: no ${langName} voice is installed on this device. Attempting to speak detected ${langName} text anyway — install a ${langName} system voice, pick a Narrator voice override, or enable ElevenLabs cloud voice in the popup, if you hear nothing.`,
           );
@@ -1027,74 +781,26 @@ function announce(text: string, rate = speechRate) {
       }
 
       utterance.onerror = (event) => {
-        if (event.error === "interrupted" || event.error === "canceled") {
-          // Expected when the user moves to a new element before the
-          // previous utterance finished — not an actual problem.
-          return;
-        }
-        console.error(
-          "[Speech] utterance error:",
-          event.error,
-          "for detected lang",
-          detectedLang,
-        );
-      };
-      utterance.onstart = () => {
-        console.log(
-          "[Speech] speaking, detected lang:",
-          detectedLang,
-          "voice:",
-          utterance.voice?.name || "(none/default)",
-        );
+        if (event.error === "interrupted" || event.error === "canceled") return;
+        console.error("[Speech] utterance error:", event.error, "lang:", detectedLang);
       };
 
       window.speechSynthesis.speak(utterance);
     };
 
-    // Chrome has a known bug where speak() called immediately after cancel()
-    // can silently drop the utterance. A tiny delay avoids the race.
-    if (pendingSpeakTimer) {
-      window.clearTimeout(pendingSpeakTimer);
-    }
+    // Chrome bug: speak() immediately after cancel() can silently drop the utterance.
+    if (pendingSpeakTimer) window.clearTimeout(pendingSpeakTimer);
     pendingSpeakTimer = window.setTimeout(speakNow, 30);
   };
 
-  console.log(
-    "[Speech] decision — detectedLang:",
-    detectedLang,
-    "hasRealLocalVoice:",
-    hasRealLocalVoice,
-    "(",
-    exactLocalVoice?.name || "none",
-    ")",
-    "useElevenLabs:",
-    useElevenLabs,
-    "elevenLabsKey set:",
-    !!elevenLabsKey,
-    "elevenLabsBlockedReason:",
-    elevenLabsBlockedReason,
-  );
-
   if (hasRealLocalVoice) {
-    // A real local voice exists for this language (or the user manually
-    // forced one) — use it. It's free and instant; no reason to spend
-    // ElevenLabs character quota on a language that already works.
+    // Strategy 1: real local voice — free and instant
     speakLocally(exactLocalVoice, false);
   } else if (useElevenLabs && elevenLabsKey) {
-    // No real local voice for this language — this is exactly the case
-    // ElevenLabs is for. But don't fire the network request immediately:
-    // aborting an in-flight fetch when a newer hover arrives doesn't
-    // guarantee the previous request gets canceled on ElevenLabs' server
-    // in time, which is exactly what was tripping their concurrency limit
-    // during fast hovering. Instead, wait briefly for the hover to settle
-    // — only the last one within this window actually reaches the network.
+    // Strategy 2: ElevenLabs cloud — debounced to avoid concurrency hammering
     elevenLabsDebounceTimer = window.setTimeout(() => {
       elevenLabsDebounceTimer = null;
-      if (myGeneration !== speechGeneration || !isEnabled) {
-        // A newer hover (or a disable) superseded this one before it ever
-        // reached the network — correctly do nothing.
-        return;
-      }
+      if (myGeneration !== speechGeneration || !isEnabled) return;
       speakWithElevenLabs(text).then((succeeded) => {
         if (!succeeded && isEnabled && myGeneration === speechGeneration) {
           speakLocally(pickOmnivorousFallbackVoice(), true);
@@ -1102,85 +808,128 @@ function announce(text: string, rate = speechRate) {
       });
     }, ELEVENLABS_DEBOUNCE_MS);
   } else {
-    // No real local voice and no cloud voice configured — best-effort
-    // guess with whatever omnivorous voice might be installed.
+    // Strategy 3: omnivorous fallback
     speakLocally(pickOmnivorousFallbackVoice(), true);
   }
 
-  if (lastAnnounce.timeout) {
-    window.clearTimeout(lastAnnounce.timeout);
-  }
+  // Clear the info panel after a short while to avoid stale text
+  if (lastAnnounce.timeout) window.clearTimeout(lastAnnounce.timeout);
   lastAnnounce.timeout = window.setTimeout(() => {
-    if (infoPanel.textContent === text) {
-      updateInfo("Blind Helper is ready.");
-    }
-  }, 7000);
+    if (infoPanel.textContent === text) updateInfo("Blind Helper is ready.");
+  }, 7_000);
 }
 
-function setHighlight(element: Element | null) {
+// ─── Highlight ───────────────────────────────────────────────────────────────
+
+function setHighlight(element: Element | null): void {
   if (!element) {
     highlight.style.display = "none";
     return;
   }
-
   const rect = element.getBoundingClientRect();
   if (rect.width === 0 || rect.height === 0) {
     highlight.style.display = "none";
     return;
   }
-
-  highlight.style.display = "block";
-  highlight.style.left = `${rect.left}px`;
-  highlight.style.top = `${rect.top}px`;
-  highlight.style.width = `${rect.width}px`;
-  highlight.style.height = `${rect.height}px`;
+  Object.assign(highlight.style, {
+    display: "block",
+    left: `${rect.left}px`,
+    top: `${rect.top}px`,
+    width: `${rect.width}px`,
+    height: `${rect.height}px`,
+  });
 }
 
-function refreshHighlight() {
-  if (currentTarget && isEnabled) {
-    setHighlight(currentTarget);
-  }
+function refreshHighlight(): void {
+  if (currentTarget && isEnabled) setHighlight(currentTarget);
 }
 
-function isVisible(element: HTMLElement) {
-  if (!element.offsetParent && element !== document.body) {
-    return false;
-  }
+// ─── DOM helpers ─────────────────────────────────────────────────────────────
+
+function isVisible(element: HTMLElement): boolean {
+  if (!element.offsetParent && element !== document.body) return false;
   const style = window.getComputedStyle(element);
   return style.visibility !== "hidden" && style.display !== "none";
 }
 
-function collectFocusableElements() {
+function collectFocusableElements(): HTMLElement[] {
   return Array.from(
     document.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
-  ).filter(
-    (element) => isVisible(element) && !element.hasAttribute("disabled"),
-  );
+  ).filter((el) => isVisible(el) && !el.hasAttribute("disabled"));
 }
 
-function applySpeechRate(rate: number, announceChange = false) {
+// ─── Speech rate ─────────────────────────────────────────────────────────────
+
+function clampSpeechRate(rate: number): number {
+  return Math.round(Math.min(SPEECH_RATE_MAX, Math.max(SPEECH_RATE_MIN, rate)) * 10) / 10;
+}
+
+function formatSpeechRate(rate: number): string {
+  return rate.toFixed(1);
+}
+
+function applySpeechRate(rate: number, announceChange = false): void {
   speechRate = clampSpeechRate(rate);
-  if (announceChange) {
-    announce(`Speech speed ${formatSpeechRate(speechRate)}`, speechRate);
+  if (announceChange) announce(`Speech speed ${formatSpeechRate(speechRate)}`, speechRate);
+}
+
+function saveSpeechRate(rate: number): void {
+  chrome?.storage?.local?.set({ speechRate: rate });
+}
+
+function adjustSpeechRate(delta: number): void {
+  applySpeechRate(speechRate + delta, true);
+  saveSpeechRate(speechRate);
+}
+
+// ─── State ───────────────────────────────────────────────────────────────────
+
+function updateState(enabled: boolean): void {
+  isEnabled = enabled;
+  if (isEnabled) {
+    updateInfo("Blind Helper is active. Hover elements or press Tab to navigate.");
+  } else {
+    stopSpeech();
+    currentTarget = null;
+    setHighlight(null);
+    updateInfo("Blind Helper is disabled. Open the popup to enable it.");
   }
 }
 
-function loadSettings() {
-  if (!chrome?.storage?.local?.get) {
-    return;
+function describeAndAnnounce(element: Element | null): void {
+  if (!element) return;
+
+  if (hoverTimer) {
+    window.clearTimeout(hoverTimer);
+    hoverTimer = null;
   }
+
+  const rawDescription = describeElement(element);
+  const friendly = getFriendlyDescription(rawDescription);
+  setHighlight(element);
+  announce(friendly);
+
+  if (!aiEnabled || !isVisualElement(element)) return;
+
+  const myToken = ++hoverToken;
+  hoverTimer = window.setTimeout(async () => {
+    const aiDescription = await analyzeVisualElementWithVision(element, friendly);
+    if (myToken !== hoverToken || !isEnabled || currentTarget !== element) return;
+    setHighlight(element);
+    announce(aiDescription);
+  }, AI_DWELL_MS);
+}
+
+// ─── Settings loader ─────────────────────────────────────────────────────────
+
+function loadSettings(): void {
+  if (!chrome?.storage?.local?.get) return;
 
   chrome.storage.local.get(
     [
-      "aiEnabled",
-      "geminiKey",
-      "speechRate",
-      "speechLang",
-      "forcedVoiceName",
-      "elevenLabsKey",
-      "elevenLabsVoiceId",
-      "useElevenLabs",
-      "geminiDailyLimit",
+      "aiEnabled", "geminiKey", "speechRate", "speechLang",
+      "forcedVoiceName", "elevenLabsKey", "elevenLabsVoiceId",
+      "useElevenLabs", "geminiDailyLimit",
     ],
     (result: any) => {
       aiEnabled = Boolean(result.aiEnabled);
@@ -1193,152 +942,49 @@ function loadSettings() {
       geminiDailyLimit =
         typeof result.geminiDailyLimit === "number"
           ? result.geminiDailyLimit
-          : geminiDailyLimit;
+          : DEFAULT_GEMINI_DAILY_LIMIT;
       voiceMissingWarnedFor = null;
       applySpeechRate(
-        typeof result.speechRate === "number"
-          ? result.speechRate
-          : SPEECH_RATE_DEFAULT,
+        typeof result.speechRate === "number" ? result.speechRate : SPEECH_RATE_DEFAULT,
       );
-      console.log(
-        "[Config] Loaded. aiEnabled:",
-        aiEnabled,
-        "geminiKey set:",
-        !!geminiKey,
-        "speechRate:",
-        speechRate,
-        "speechLang:",
-        speechLang,
-        "useElevenLabs:",
-        useElevenLabs,
-        "elevenLabsKey set:",
-        !!elevenLabsKey,
-        "elevenLabsVoiceId:",
-        elevenLabsVoiceId,
-      );
-
-      if (geminiKey) {
-        checkAvailableModels();
-      }
+      if (geminiKey) checkAvailableModels();
     },
   );
 }
 
-function saveSpeechRate(rate: number) {
-  if (!chrome?.storage?.local?.set) {
-    return;
-  }
-
-  chrome.storage.local.set({ speechRate: rate });
-}
-
-function adjustSpeechRate(delta: number) {
-  applySpeechRate(speechRate + delta, true);
-  saveSpeechRate(speechRate);
-}
-
-async function checkAvailableModels() {
+async function checkAvailableModels(): Promise<void> {
   try {
-    console.log("[Debug] Checking available models with your API key...");
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(geminiKey)}`,
     );
-
     if (!response.ok) {
-      console.error(
-        "[Debug] Failed to list models:",
-        response.status,
-        await response.text(),
-      );
+      console.error("[Debug] Failed to list models:", response.status);
       return;
     }
-
     const data = await response.json();
     const models = (data.models || [])
-      .filter((m: any) =>
-        m.supportedGenerationMethods?.includes("generateContent"),
-      )
+      .filter((m: any) => m.supportedGenerationMethods?.includes("generateContent"))
       .map((m: any) => m.name);
-
     console.log("[Debug] Available vision models:", models);
   } catch (err) {
     console.error("[Debug] Error checking models:", err);
   }
 }
 
-function updateState(enabled: boolean) {
-  isEnabled = enabled;
-  if (isEnabled) {
-    updateInfo(
-      "Blind Helper is active. Hover elements or press Tab to navigate.",
-    );
-  } else {
-    stopSpeech();
-    currentTarget = null;
-    updateInfo("Blind Helper is disabled. Open the popup to enable it.");
-    setHighlight(null);
-  }
-}
+// ─── Event handlers ──────────────────────────────────────────────────────────
 
-function describeAndAnnounce(element: Element | null) {
-  if (!element) return;
-
-  if (hoverTimer) {
-    window.clearTimeout(hoverTimer);
-    hoverTimer = null;
-  }
-
-  // Always speak the fast, DOM-based description immediately.
-  const rawDescription = describeElement(element);
-  const friendly = getFriendlyDescription(rawDescription);
-  setHighlight(element);
-  announce(friendly);
-
-  // Only spend an AI vision call if the user actually dwells on this element.
-  if (!aiEnabled || !isVisualElement(element)) {
-    return;
-  }
-
-  const myToken = ++hoverToken;
-  hoverTimer = window.setTimeout(async () => {
-    const aiDescription = await analyzeVisualElementWithVision(
-      element,
-      friendly,
-    );
-
-    if (myToken !== hoverToken || !isEnabled || currentTarget !== element) {
-      return;
-    }
-
-    setHighlight(element);
-    announce(aiDescription);
-  }, AI_DWELL_MS);
-}
-
-async function handleMouseMove(event: MouseEvent) {
-  if (!isEnabled) {
-    return;
-  }
-
+function handleMouseMove(event: MouseEvent): void {
+  if (!isEnabled) return;
   const target = event.target as Element | null;
-  if (
-    !target ||
-    target === currentTarget ||
-    target === highlight ||
-    target === infoPanel ||
-    target === liveRegion
-  ) {
+  if (!target || target === currentTarget || target === highlight || target === infoPanel || target === liveRegion) {
     return;
   }
-
   currentTarget = target;
   describeAndAnnounce(target);
 }
 
-async function handleKeyDown(event: KeyboardEvent) {
-  if (!isEnabled) {
-    return;
-  }
+function handleKeyDown(event: KeyboardEvent): void {
+  if (!isEnabled) return;
 
   if (event.altKey && event.shiftKey && event.key === "ArrowUp") {
     event.preventDefault();
@@ -1365,14 +1011,10 @@ async function handleKeyDown(event: KeyboardEvent) {
     }
 
     const current = document.activeElement as HTMLElement | null;
-    const currentIndex = focusables.indexOf(
-      current ?? (document.body as HTMLElement),
-    );
+    const currentIndex = focusables.indexOf(current ?? (document.body as HTMLElement));
     const direction = event.shiftKey ? -1 : 1;
     focusIndex = currentIndex >= 0 ? currentIndex + direction : 0;
-    if (focusIndex < 0) {
-      focusIndex = focusables.length - 1;
-    }
+    if (focusIndex < 0) focusIndex = focusables.length - 1;
     focusIndex = focusIndex % focusables.length;
 
     const next = focusables[focusIndex];
@@ -1381,74 +1023,51 @@ async function handleKeyDown(event: KeyboardEvent) {
   }
 }
 
-function handleMessage(message: any, _sender: any, sendResponse: any) {
-  if (!message || typeof message !== "object") {
-    return;
-  }
+// ─── Message dispatch (Command map pattern) ───────────────────────────────────
 
-  if (message.action === "setEnabled") {
+type MessageHandler = (message: any, sendResponse: (r: any) => void) => void;
+
+const MESSAGE_HANDLERS: Record<string, MessageHandler> = {
+  setEnabled(message, sendResponse) {
     updateState(Boolean(message.enabled));
     sendResponse({ enabled: isEnabled });
-    return;
-  }
+  },
 
-  if (message.action === "setAiConfig") {
+  setAiConfig(message, sendResponse) {
     aiEnabled = Boolean(message.aiEnabled);
     geminiKey = message.geminiKey || "";
-    console.log(
-      "[Message] setAiConfig received. aiEnabled:",
-      aiEnabled,
-      "geminiKey set:",
-      !!geminiKey,
-    );
     sendResponse({ ok: true });
-    return;
-  }
+  },
 
-  if (message.action === "setSpeechRate") {
+  setSpeechRate(message, sendResponse) {
     applySpeechRate(Number(message.speechRate));
     sendResponse({ speechRate });
-    return;
-  }
+  },
 
-  if (message.action === "setLanguage") {
+  setLanguage(message, sendResponse) {
     speechLang = message.speechLang || DEFAULT_LANGUAGE_CODE;
     voiceMissingWarnedFor = null;
     sendResponse({ speechLang });
-    return;
-  }
+  },
 
-  if (message.action === "setForcedVoice") {
+  setForcedVoice(message, sendResponse) {
     forcedVoiceName = message.forcedVoiceName || "";
     sendResponse({ forcedVoiceName });
-    return;
-  }
+  },
 
-  if (message.action === "setElevenLabsConfig") {
+  setElevenLabsConfig(message, sendResponse) {
     elevenLabsKey = message.elevenLabsKey ?? elevenLabsKey;
     elevenLabsVoiceId = message.elevenLabsVoiceId ?? elevenLabsVoiceId;
     useElevenLabs = Boolean(message.useElevenLabs);
-    elevenLabsBlockedReason = null;
-    sendResponse({
-      elevenLabsKey: !!elevenLabsKey,
-      elevenLabsVoiceId,
-      useElevenLabs,
-    });
-    return;
-  }
+    elevenLabsBlockedReason = null; // reset on config change
+    sendResponse({ elevenLabsKey: !!elevenLabsKey, elevenLabsVoiceId, useElevenLabs });
+  },
 
-  if (message.action === "queryState") {
-    sendResponse({
-      enabled: isEnabled,
-      speechRate,
-      speechLang,
-      forcedVoiceName,
-      useElevenLabs,
-    });
-    return;
-  }
+  queryState(_message, sendResponse) {
+    sendResponse({ enabled: isEnabled, speechRate, speechLang, forcedVoiceName, useElevenLabs });
+  },
 
-  if (message.action === "announceHover") {
+  announceHover(_message, sendResponse) {
     if (currentTarget) {
       describeAndAnnounce(currentTarget);
       sendResponse({ ok: true });
@@ -1456,12 +1075,10 @@ function handleMessage(message: any, _sender: any, sendResponse: any) {
       announce("No hovered item detected yet.");
       sendResponse({ ok: false });
     }
-    return;
-  }
+  },
 
-  if (message.action === "announceFocus") {
-    const target =
-      document.activeElement instanceof Element ? document.activeElement : null;
+  announceFocus(_message, sendResponse) {
+    const target = document.activeElement instanceof Element ? document.activeElement : null;
     if (target) {
       describeAndAnnounce(target);
       sendResponse({ ok: true });
@@ -1469,18 +1086,22 @@ function handleMessage(message: any, _sender: any, sendResponse: any) {
       announce("No focused item detected.");
       sendResponse({ ok: false });
     }
-    return;
-  }
+  },
+};
+
+function handleMessage(message: any, _sender: any, sendResponse: any): void {
+  if (!message || typeof message !== "object") return;
+  const handler = MESSAGE_HANDLERS[message.action];
+  handler?.(message, sendResponse);
 }
+
+// ─── Bootstrap ───────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener(handleMessage);
 
 if (chrome?.storage?.onChanged) {
   chrome.storage.onChanged.addListener((changes: any, areaName: string) => {
-    if (areaName !== "local" || !changes.speechRate) {
-      return;
-    }
-
+    if (areaName !== "local" || !changes.speechRate) return;
     applySpeechRate(changes.speechRate.newValue ?? SPEECH_RATE_DEFAULT);
   });
 }
